@@ -1170,6 +1170,7 @@ def _env_bool(name: str, default: bool = False) -> bool:
 from plugins.platforms.discord.adapter_media import DiscordMediaMixin
 from plugins.platforms.discord.adapter_opus import load_opus_codec
 from plugins.platforms.discord.adapter_authorization import DiscordAuthorizationMixin
+from plugins.platforms.discord.adapter_recovery import recovery_extra
 from plugins.platforms.discord.adapter_slash_auth import DiscordSlashAuthMixin
 from plugins.platforms.discord.adapter_thread_titles import DiscordThreadTitlesMixin, SemanticThreadRenames
 from plugins.platforms.discord.adapter_voice_info import DiscordVoiceInfoMixin
@@ -1466,8 +1467,7 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
                 adapter_self._post_connect_task = asyncio.create_task(
                     adapter_self._run_post_connect_initialization()
                 )
-                if adapter_self._missed_message_backfill_enabled():
-                    adapter_self._ensure_missed_message_backfill_task()
+                adapter_self._ensure_missed_message_backfill_task()  # stop replay, then opt-in backfill
 
             @self._client.event
             async def on_socket_event_type(event_type: str):
@@ -2422,11 +2422,11 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
             "max_attempts", "DISCORD_MISSED_MESSAGE_BACKFILL_MAX_ATTEMPTS", 3, int, 1, 100)
 
     def _ensure_missed_message_backfill_task(self) -> asyncio.Task:
-        """Return the active recovery task, or start one when none is running."""
+        """Return the active reconnect-recovery task, or start one when none is running."""
         task = self._missed_message_backfill_task
         if task is not None and not task.done():
             return task
-        task = asyncio.create_task(self._run_missed_message_backfill())
+        task = asyncio.create_task(self._run_reconnect_recovery())
         self._missed_message_backfill_task = task
         runner = getattr(self, "gateway_runner", None)
         if runner is not None and getattr(runner, "_startup_restore_in_progress", False):
@@ -2514,8 +2514,8 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
             and not self._discord_thread_require_mention()
         )
 
-    async def _dispatch_recovered_message(self, message: Any) -> bool:
-        """Run one recovered message through the live Discord ingress gates."""
+    async def _dispatch_recovered_message(self, message: Any, *, claim: bool = False) -> bool:
+        """Run one recovered message through the live Discord ingress gates (``claim``: own its dedup id)."""
         if not isinstance(message.channel, discord.DMChannel):
             parent_id = self._get_parent_channel_id(message.channel)
             channel_keys = self._discord_channel_keys(message, parent_id)
@@ -2528,7 +2528,7 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
                 and not self._self_is_explicitly_mentioned(message)
             ):
                 return False
-        admitted, role_authorized = self._discord_message_admission(message, claim=False)
+        admitted, role_authorized = self._discord_message_admission(message, claim=claim)
         if not admitted:
             return False
         return await self._handle_message(message, role_authorized=role_authorized, recovered=True)
@@ -7188,9 +7188,7 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
         if key in discord_cfg:
             seeded_extra[key] = discord_cfg[key]
             _env_default(env_key, str(discord_cfg[key]).lower())
-    backfill_cfg = discord_cfg.get("missed_message_backfill")
-    if isinstance(backfill_cfg, dict):
-        seeded_extra["missed_message_backfill"] = dict(backfill_cfg)
+    seeded_extra.update(recovery_extra(discord_cfg))
     _gate("ignored_channels", "DISCORD_IGNORED_CHANNELS", from_platform_extra=False)
     _gate("allowed_channels", "DISCORD_ALLOWED_CHANNELS", from_platform_extra=False)
     _gate("no_thread_channels", "DISCORD_NO_THREAD_CHANNELS", from_platform_extra=False)

@@ -56,6 +56,9 @@ async def admit_message(authority, event):
             named = f'{exc.reason}: {exc.field}' if exc.field in _CONTENT_CLAUSES else exc.reason
             return (f'⚠️ Hermes refused this message ({named}), so it was not saved '
                     'or answered. Ask the operator to check gateway.log.')
+        if exc.reason == 'runtime_draining' and authority.runner._draining:
+            from gateway.drain_control import defer_drain_refused
+            defer_drain_refused(authority.runner, event)  # still raised: v0.23.1's turn-error notice
         if exc.reason != 'queue_full':
             raise
         # Nothing was committed (main's busy-queue cap): say so instead of a generic turn error.

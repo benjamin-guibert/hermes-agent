@@ -3,13 +3,18 @@ from __future__ import annotations
 
 from typing import Any, Callable, Optional, Tuple
 
+from plugins.platforms.discord.adapter_recovery import DiscordRecoveryMixin
+
 try:
     import discord
 except ImportError:  # the adapter does not start without discord.py
     discord = None
 
 
-class DiscordSlashAuthMixin:
+# DiscordRecoveryMixin rides here (carry patch): the DiscordAdapter bases line belongs to the
+# bot-tag carry patch, and each carry patch must revert alone. The MRO is the same as listing it
+# right before BasePlatformAdapter.
+class DiscordSlashAuthMixin(DiscordRecoveryMixin):
     _get_parent_channel_id: Callable[[Any], Optional[str]]
     _discord_channel_keys_from_channel: Callable[..., set]
     _get_allowed_channels: Callable[[], set]

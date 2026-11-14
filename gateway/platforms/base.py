@@ -1853,6 +1853,7 @@ class BasePlatformAdapter(ABC):
         self.platform = platform
         self._message_handler: Optional[MessageHandler] = None
         self._no_message_handler_logged: bool = False
+        self._admission_withdrawn = False  # a handler was removed: the shutdown drain
         self._reaction_handler: Optional[Callable[[dict[str, Any]], Awaitable[None]]] = None
         # Runner-owned boundary for normalized events: auth/profile state never lives in an adapter.
         self._platform_event_handler: Optional[Callable[[dict[str, Any], Any], Awaitable[None]]] = None
@@ -2254,8 +2255,14 @@ class BasePlatformAdapter(ABC):
         return self._running
 
     def set_message_handler(self, handler: MessageHandler) -> None:
-        """Set the incoming-message handler (MessageEvent -> optional response str)."""
+        """Set the incoming-message handler (MessageEvent -> optional response str); ``None`` after a
+        handler is the shutdown drain withdrawing admission."""
+        self._admission_withdrawn = handler is None and (self._admission_withdrawn or self._message_handler is not None)
         self._message_handler = handler
+
+    def defer_refused_inbound(self, event: MessageEvent) -> None:
+        """The runner refused *event* only because it drains for a stop. An adapter that can give it a
+        turn after the restart records it here (Discord's stop replay); the default keeps the notice."""
 
     def set_platform_event_handler(
         self, handler: Optional[Callable[[dict[str, Any], Any], Awaitable[None]]]) -> None:
@@ -3917,9 +3924,12 @@ class BasePlatformAdapter(ABC):
         task so new messages (and interrupts) can arrive while an agent runs."""
         event._gateway_accepted = False
         if not self._message_handler:
-            # No handler = every inbound silently discarded on an adapter that still polls and sends;
-            # say so once per adapter (#102260).
-            if not getattr(self, "_no_message_handler_logged", False):
+            # Shutdown withdrew admission: name each dropped event, nothing replays it (#146858). Never
+            # installed: every inbound is discarded on a live adapter; say so once (#102260).
+            if getattr(self, "_admission_withdrawn", False):
+                logger.warning("[%s] Dropping inbound message %s at shutdown: admission was withdrawn (session %s)",
+                               self.name, event.message_id, self._event_session_key(event))
+            elif not getattr(self, "_no_message_handler_logged", False):
                 self._no_message_handler_logged = True
                 logger.error("[%s] Dropping inbound message: no gateway message handler is installed on this "
                              "adapter. The adapter is connected and can send, but every inbound message is "
