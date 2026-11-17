@@ -133,3 +133,22 @@ def test_snapshot_does_not_turn_later_commands_into_delegated_children(tmp_path)
         assert "[]" in parent["output"], f"parent command inherited the marker: {parent!r}"
     finally:
         env.cleanup()
+
+
+@pytest.mark.platforms("posix")  # POSIX bash snapshot path
+def test_cron_run_identity_does_not_outlive_its_run_in_the_snapshot(tmp_path):
+    """A cron run's identity reaches its own commands only: a snapshot re-dumped during the run
+    must not hand it to a later session, whose own-job removal it would then refuse."""
+    from cron.jobs_removal import run_identity_scope
+    from tools.environments.local import LocalEnvironment
+
+    probe = 'printf "[${HERMES_CRON_EXECUTION_ID-}]"'
+    env = LocalEnvironment(cwd=str(tmp_path), timeout=30)
+    try:
+        with run_identity_scope("exec-1"):
+            run = env.execute(probe)
+        assert "[exec-1]" in run["output"], f"the run's command lost its identity: {run!r}"
+        later = env.execute(probe)
+        assert "[]" in later["output"], f"a later command inherited the run identity: {later!r}"
+    finally:
+        env.cleanup()
