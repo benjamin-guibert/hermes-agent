@@ -2097,7 +2097,7 @@ DEFAULT_CONFIG = {
         # platform send; a gateway that died between finalize and platform ACK redelivers on next
         # boot (ambiguous cases carry a "recovered reply — may be a duplicate" marker;
         # at-least-once). Disable to lose in-flight final responses on crash/restart.
-        "delivery_ledger": True,
+        "delivery_ledger": True, "process_notice_replay": True,  # the 2nd: owed process notices survive a restart
         # Seconds to wait for one platform to connect at startup/reconnect; raise on "discord
         # connect timed out" loops (many slash commands to sync). 0/negative = wait forever. Bridged
         # to HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT, which wins if set explicitly.
