@@ -80,6 +80,8 @@ With `group_sessions_per_user: false`:
 - the whole room shares one running-agent slot for that channel/thread
 - follow-up messages from different people can interrupt or queue behind each other
 
+Messages that a planned gateway stop refused or dropped are replayed once after the restart, when the stop is less than 30 minutes old. Disable with `discord.stop_replay: false`.
+
 This guide walks you through the full setup process — from creating your bot on Discord's Developer Portal to sending your first message.
 
 ### Gateway WebSocket health

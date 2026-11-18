@@ -237,3 +237,12 @@ def read_drain_request(*, home: Optional[Path] = None) -> Optional[dict[str, Any
     except (ValueError, TypeError):
         return {}
     return data if isinstance(data, dict) else {}
+
+
+def defer_drain_refused(runner: Any, event: Any) -> None:
+    """A drain refused *event* before it reached a session: the adapter that received it may give it
+    a turn after the restart (``BasePlatformAdapter.defer_refused_inbound``)."""
+    adapter = runner._intake_adapter_for(getattr(event, "source", None))
+    defer = getattr(adapter, "defer_refused_inbound", None)  # a duck-typed adapter: keep the refusal as is
+    if defer is not None:
+        defer(event)
