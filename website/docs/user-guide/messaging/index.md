@@ -666,6 +666,8 @@ HERMES_BACKGROUND_NOTIFICATIONS=result
 
 With `terminal(background=true, notify_on_complete=true)` the finished process starts a new agent turn and the agent reports the result itself, so no separate status line is sent. The exception is a process that finishes while the turn that launched it is still running: the completion is queued as the agent's next turn and you get the one-line `concise` status right away (unless the mode is `off`, or `error` with a zero exit code), instead of silence until that turn ends.
 
+A gateway restart does not lose that turn. When such a process exits while the gateway is stopping or down, the next gateway start delivers its notice to the same session. When the restart itself (or an agent session closing) kills the process, the session gets one notice that says the task was interrupted, with the cause and the time, so the agent can start it again. A process stopped on purpose (`process` kill, abandoned-turn cleanup) stays silent. Notices older than 48 hours are not replayed; `process(action="log")` still reads them. Disable with `gateway.process_notice_replay: false`.
+
 ### Use Cases
 
 - **Server monitoring** — "/bg Check the health of all services and alert me if anything is down"

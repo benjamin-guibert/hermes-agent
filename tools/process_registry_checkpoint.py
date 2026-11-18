@@ -7,11 +7,15 @@ import time
 from typing import Any, Dict, List, Optional
 
 from agent.redact import redact_sensitive_text
+from hermes_constants import get_hermes_home
 
 logger = logging.getLogger("tools.process_registry")
 
 
 class ProcessCheckpointMixin:
+    # (profile home, session id) of every notice already re-armed in this process (lazy).
+    _restored_notices: Optional[set] = None
+
     def _detached_host_fate(self, pid: Optional[int], expected_start: Optional[int]) -> str:
         """Subclass supplies the live PID decision. See ProcessRegistry."""
         raise NotImplementedError
@@ -82,12 +86,21 @@ class ProcessCheckpointMixin:
                 and (_exit_path(log).exists() or self._detached_host_fate(
                     entry.get("pid"), entry.get("host_start_time")) == "running")]
 
-    def recover_from_checkpoint(self) -> int:
+    def recover_from_checkpoint(self, *, restore_notices: bool = False) -> int:
         """On gateway startup, probe PIDs from the checkpoint file; returns how many
-        were recovered as detached sessions."""
+        were recovered as detached sessions. ``restore_notices`` (the gateway's startup only: a
+        managed worker adopts processes, the gateway owns their notices) also records the deaths
+        found at boot and re-arms every notice this profile's receipts still owe, also without a
+        checkpoint file (a clean stop leaves none)."""
+        recovered = self._adopt_checkpoint_processes(restore_notices)
+        if restore_notices:
+            self.restore_pending_notifications()
+        return recovered
+
+    def _adopt_checkpoint_processes(self, record_deaths: bool) -> int:
         from tools.process_registry import (
             ProcessSession, _CHECKPOINT_FIELDS, _checkpoint_path,
-            _CHECKPOINT_DEFAULTS, _WATCHER_ROUTE_KEYS, _stop_systemd_unit,
+            _CHECKPOINT_DEFAULTS, _stop_systemd_unit,
         )
         from tools.process_registry_output_log import adoptable_log
 
@@ -99,7 +112,7 @@ class ProcessCheckpointMixin:
             return 0
         try:
             entries = json.loads(checkpoint_path.read_text(encoding="utf-8-sig"))
-        except Exception:
+        except (OSError, ValueError):
             return 0
         recovered = 0
         unresolved_scope_entries: list[dict[str, Any]] = []
@@ -144,6 +157,9 @@ class ProcessCheckpointMixin:
                         "retaining checkpoint entry for the next startup",
                         systemd_unit, pid)
                     unresolved_scope_entries.append(entry)
+                    continue
+                if record_deaths:
+                    self._record_downtime_death(entry)
                 continue
             fields = {f: entry.get(f, _CHECKPOINT_DEFAULTS[f]) for f in _CHECKPOINT_FIELDS}
             fields.update(
@@ -163,13 +179,73 @@ class ProcessCheckpointMixin:
             logger.info("Recovered detached process: %s (pid=%d)", session.command[:60], pid)
             # Re-enqueue watcher so gateway can resume notifications
             if session.watcher_interval > 0:
-                self.pending_watchers.append({
-                    "session_id": session.id,
-                    "check_interval": session.watcher_interval,
-                    "session_key": session.session_key,
-                    **{key: getattr(session, f"watcher_{key}") for key in _WATCHER_ROUTE_KEYS},
-                    "notify_on_complete": session.notify_on_complete,
-                    "parent_session_id": session.parent_session_id,
-                })
+                self._queue_recovered_watcher(session)
         self._write_checkpoint(extra_entries=unresolved_scope_entries)
         return recovered
+
+    def restore_pending_notifications(self) -> int:
+        """Gateway startup: arm ONE watcher per receipt of this profile that still owes a notice.
+
+        The snapshot has no handle, so nothing is re-run or signalled. A lifecycle-killed
+        process replays as its death notice (``interrupted_death``), never also as a plain
+        completion. Idempotent per profile home and session id. At-least-once: a crash between
+        acceptance and settling replays once.
+        """
+        from tools.process_registry_results import (
+            needs_interrupt_notice, pending_notification_results, process_notice_replay_enabled,
+        )
+        if not process_notice_replay_enabled():
+            return 0
+        home = str(get_hermes_home().resolve())
+        restored = 0
+        for session in pending_notification_results():
+            with self._lock:
+                if self._restored_notices is None:
+                    self._restored_notices = set()
+                if (home, session.id) in self._restored_notices or session.id in self._running:
+                    continue
+                self._restored_notices.add((home, session.id))
+                self._finished.setdefault(session.id, session)
+            death = needs_interrupt_notice(session)
+            self._queue_recovered_watcher(session, dead_session=session, interrupted_death=death)
+            restored += 1
+            logger.info("Re-armed the owed %s notice of %s", "death" if death else "completion", session.id)
+        return restored
+
+    def _queue_recovered_watcher(self, session, **extra) -> None:
+        from tools.process_registry import _WATCHER_ROUTE_KEYS
+
+        self.pending_watchers.append({
+            "session_id": session.id,
+            "check_interval": session.watcher_interval or 5,
+            "session_key": session.session_key,
+            **{key: getattr(session, f"watcher_{key}") for key in _WATCHER_ROUTE_KEYS},
+            "notify_on_complete": session.notify_on_complete or bool(extra.get("interrupted_death")),
+            "parent_session_id": session.parent_session_id,
+            **extra,
+        })
+
+    def _record_downtime_death(self, entry: dict[str, Any]) -> None:
+        """A checkpoint entry whose PID is gone at boot died while the gateway was down. A
+        completion-contract holder owed its owner a notice: write a ``lost`` /
+        ``gateway_downtime`` receipt so ``restore_pending_notifications`` replays it."""
+        from tools.process_registry import ProcessSession, _WATCHER_ROUTE_KEYS
+        from tools.process_registry_results import process_notice_replay_enabled, save_completed_result
+
+        receipt = get_hermes_home() / "logs" / "process-results" / f"{entry.get('session_id')}.json"
+        if not (entry.get("notify_on_complete") or entry.get("persist_on_release")) or receipt.exists():
+            return  # No contract, or its real exit is on record (a crash before the checkpoint write).
+        if not process_notice_replay_enabled():
+            return
+        keys = ("task_id", "owner_task_id", "session_key", "parent_session_id", "started_at", "cwd",
+                "watcher_interval", *(f"watcher_{key}" for key in _WATCHER_ROUTE_KEYS))
+        session = ProcessSession(
+            id=entry.get("session_id", ""), command=entry.get("command", "unknown"),
+            **{key: entry[key] for key in keys if entry.get(key) is not None},
+            exited=True, exit_code=None, completion_reason="lost", termination_source="gateway_downtime",
+            exited_at=time.time(), notify_on_complete=bool(entry.get("notify_on_complete")),
+            persist_on_release=bool(entry.get("persist_on_release")),
+        )
+        save_completed_result(session)
+        logger.warning("Process %s died while the gateway was down (pid %s gone at recovery); "
+                       "its owner gets an interruption notice", session.id, entry.get("pid"))
