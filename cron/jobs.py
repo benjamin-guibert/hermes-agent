@@ -8,7 +8,6 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 import json
 import logging
-import shutil
 import sys
 import threading
 import time
@@ -152,12 +151,16 @@ _self_removal_delivery: ContextVar[Optional[_SelfRemovalDelivery]] = ContextVar(
 
 
 @contextlib.contextmanager
-def self_removal_delivery_scope(job_id: str):
-    """Permit this run's final delivery after it removes its own job record."""
+def self_removal_delivery_scope(job_id: str, execution_id: Optional[str] = None):
+    """Permit this run's final delivery after it removes its own job record. *execution_id* also
+    marks the run's child processes, whose removal of this job is refused (``cron.jobs_removal``)."""
+    from cron.jobs_removal import run_identity_scope
+
     marker = _SelfRemovalDelivery(job_id)
     token = _self_removal_delivery.set(marker)
     try:
-        yield marker
+        with run_identity_scope(execution_id):
+            yield marker
     finally:
         _self_removal_delivery.reset(token)
 
@@ -2272,37 +2275,9 @@ def rearm_oneshot(job_id: str, run_at: Any) -> Optional[dict[str, Any]]:
 
 
 def remove_job(job_id: str) -> bool:
-    """Remove a job by ID or name."""
-    job = resolve_job_ref(job_id)
-    if not job:
-        return False
-    canonical_id = job["id"]
-    with _jobs_lock():
-        jobs = load_jobs()
-        original_len = len(jobs)
-        jobs = [j for j in jobs if j["id"] != canonical_id]
-        if len(jobs) == original_len:
-            return False
-        # Resolve BEFORE saving so a legacy unsafe ID fails closed without a half-applied removal.
-        job_output_dir = _job_output_dir(canonical_id)
-        save_jobs(jobs, removed_ids={canonical_id})
-        marker = _self_removal_delivery.get()
-        if marker is not None and marker.job_id == canonical_id:
-            marker.removed = True
-        else:  # someone else removed it: its live run must stop, not burn tokens to a discard
-            cancel_job_run(canonical_id, reason="job removed while running")
-        if job_output_dir.exists():
-            shutil.rmtree(job_output_dir)
-        try:
-            from cron.notepad import clear_notepad
-            clear_notepad(canonical_id)
-        except Exception:
-            logger.debug("Failed to clear notepad for removed job %s", canonical_id, exc_info=True)
-        # Prune the fire-fence lock entry so the registry doesn't grow monotonically.
-        _fence_key = f"{_current_cron_store().cron_dir.resolve()}::{canonical_id}"
-        with _fire_fence_locks_guard:
-            _fire_fence_locks.pop(_fence_key, None)
-        return True
+    """Remove a job by ID or name; refuse a removal from a child of the job's own live run."""
+    from cron.jobs_removal import remove_job as remove
+    return remove(job_id)
 
 
 def cancel_job_run(job_id: str, reason: Optional[str] = None) -> dict[str, Any]:
