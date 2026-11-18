@@ -81,7 +81,7 @@ class TestDrainWaitsForBackgroundDelegations:
         runner, _ = make_restart_runner()
         monkeypatch.setattr(ad, "active_count", lambda: 2)
         counts = runner._drain_work_counts()
-        assert len(counts) == 5, "_drain_work_counts must expose the delegation slot"
+        assert len(counts) == 6, "_drain_work_counts must expose the delegation slot (then final sends)"
         assert counts[4] == 2, "delegations is the 5th slot of _drain_work_counts"
 
 

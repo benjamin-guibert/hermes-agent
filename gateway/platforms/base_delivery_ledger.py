@@ -9,6 +9,8 @@ import asyncio
 import logging
 from typing import Any, Awaitable, Callable, Optional
 
+from gateway.final_delivery_claims import claim, take_claim
+
 logger = logging.getLogger("gateway.platforms.base")
 
 
@@ -16,13 +18,22 @@ async def ledger_bracket(adapter: Any, event: Any, session_key: str, text_conten
                          send: Callable[[Any, Optional[str]], Awaitable[Any]], *,
                          is_ephemeral_response: bool = False) -> "tuple[Any, Any]":
     """Resolve the CURRENT delivery adapter, record, ``send(delivery_adapter, obligation_id)``, finalize.
-    Returns the send result with the adapter that owns it."""
+    Returns the send result with the adapter that owns it. A ledgered send is active work until its
+    row is marked (``gateway.final_delivery_claims``), so a restart cannot stop it mid-send."""
     delivery_adapter = adapter._final_delivery_adapter(event.source)
-    obligation_id = await adapter._record_delivery_obligation(
-        event, session_key, text_content, delivery_adapter, is_ephemeral_response)
-    result = await send(delivery_adapter, obligation_id)
-    if obligation_id is not None:
-        await adapter._finalize_delivery_obligation(obligation_id, result, event, delivery_adapter)
+    held = take_claim(event) or claim(getattr(adapter, "gateway_runner", None), event.source, session_key)
+    try:
+        obligation_id = await adapter._record_delivery_obligation(
+            event, session_key, text_content, delivery_adapter, is_ephemeral_response)
+        if obligation_id is None and held is not None:
+            held.release()  # not ledgered (ledger off, a command reply): no boot resends it
+            held = None
+        result = await send(delivery_adapter, obligation_id)
+        if obligation_id is not None:
+            await adapter._finalize_delivery_obligation(obligation_id, result, event, delivery_adapter)
+    finally:
+        if held is not None:
+            held.release()
     return result, delivery_adapter
 
 
