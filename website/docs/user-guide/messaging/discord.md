@@ -107,6 +107,8 @@ Any knob at `0` disables the whole WebSocket liveness probe. Values that fail to
 
 `websocket_event_max_silence_seconds` is the exception: it guards a single dimension (event dispatch), so `0` opts out of **that check only** — ready/ACK/latency keep guarding. A socket can stay ESTABLISHED and keep ACKing heartbeats while delivering zero Gateway events; heartbeat ACKs are frames without an event type, so no transport-side check can see that state. The default (4 hours) matches the outage window operators have observed in the field; a quiet guild can legitimately go hours without a single Gateway event, so keep this bound generous unless you know your traffic.
 
+When a liveness failure forces a reconnect, a message that reached the old connection just before it (for example a text batch still waiting for its quiet period) is held and answered once by the new connection, unless the reconnect takes more than 30 minutes. Disable with `discord.reconnect_hold_inbound: false`.
+
 :::tip[Shortcut: let the wizard do Steps 5–7]
 Create the application and copy the bot token (Steps 1–4), then run `hermes gateway setup` and pick **Discord**. Hermes checks the token with Discord, tells you if **Message Content Intent** is off (with a link straight to the toggle), prints a ready-made invite link for your server, and allowlists you as the bot's owner — no Developer Mode needed.
 :::

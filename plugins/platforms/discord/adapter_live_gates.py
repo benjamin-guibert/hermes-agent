@@ -11,6 +11,7 @@ from __future__ import annotations
 from typing import Any, Callable
 
 from gateway.platforms._shared import bridge_owns_env, mark_live_gate_baseline, refresh_live_gate_extra
+from plugins.platforms.discord.adapter_reconnect_hold import DiscordReconnectHoldMixin
 
 # The ``extra`` keys the gate reads (``DiscordAdapter._gate_raw``): refreshed together so env and
 # extra never disagree about which config they came from.
@@ -20,7 +21,9 @@ _LIVE_GATE_EXTRA_KEYS = (
 )
 
 
-class DiscordLiveGatesMixin:
+# DiscordReconnectHoldMixin rides here (carry patch): the DiscordAdapter bases line belongs to the
+# bot-tag carry patch. Its handle_message runs before the stop replay's (DiscordRecoveryMixin).
+class DiscordLiveGatesMixin(DiscordReconnectHoldMixin):
     _gate_raw: Callable[..., Any]
     _gate_csv_set: Callable[[Any], set]
     _snapshot_gate_env: Callable[[], None]
