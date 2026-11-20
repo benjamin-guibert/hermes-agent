@@ -1155,6 +1155,7 @@ class VoiceReceiver:
         )
 
 
+from plugins.platforms.discord.adapter_archived_status import archived_status_extra, skip_status_in_archived_thread
 from plugins.platforms.discord.adapter_config_readers import (
     _DISCORD_PROMPT_TIMEOUT_DEFAULT, _DISCORD_PROMPT_TIMEOUT_MIN, _read_discord_prompt_timeout, _read_dm_role_auth_guild,
     _resolve_exec_approval_admin_gate)
@@ -3024,9 +3025,7 @@ class DiscordAdapter(DiscordLiveGatesMixin, DiscordCommandSyncMixin, DiscordAuth
             # Backfill replays from this table: record the dropped final reply as failed or it is lost.
             return await self._record_response_async(reply_to, result, content, bool(metadata and metadata.get("notify")), metadata)
         try:
-            thread_id = None
-            if metadata and metadata.get("thread_id"):
-                thread_id = metadata["thread_id"]
+            thread_id = (metadata or {}).get("thread_id") or None
             nonconversational = _metadata_marks_nonconversational(metadata)
             final_delivery = bool(metadata and metadata.get("notify"))
             if thread_id:
@@ -3037,6 +3036,8 @@ class DiscordAdapter(DiscordLiveGatesMixin, DiscordCommandSyncMixin, DiscordAuth
                 channel = await self._resolve_channel(chat_id)
                 if not channel:
                     return SendResult(success=False, error=f"Channel {chat_id} not found")
+            if (skipped := skip_status_in_archived_thread(self.config.extra, channel, nonconversational)) is not None:
+                return skipped
             # Forum channels reject channel.send() — create a thread post instead.
             if self._is_forum_parent(channel):
                 result = await self._send_to_forum(channel, content)
@@ -7012,6 +7013,7 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
             seeded_extra[primary_key] = value
             if env_key:
                 _env_default(env_key, str(value))
+    seeded_extra.update(archived_status_extra(discord_cfg))
     return seeded_extra or None
 
 
