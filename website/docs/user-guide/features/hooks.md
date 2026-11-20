@@ -884,6 +884,8 @@ Scope a hook to the coding context by checking `coding` and make it one-shot wit
 
 **Fires:** In `agent/conversation_loop.py`, at the point the agent would accept a final answer, immediately after the verify-on-stop check — but only when the agent edited code this turn and at least one `pre_verify` hook is registered.
 
+With `agent.pre_verify_all_replies: true` the hooks also fire on the final reply of a turn that edited no files (`changed_paths` is `[]`). A draft such a hook sends back is not shown to the user (no interim message); the model still sees it, and it becomes the reply if the iteration budget runs out. A draft already streamed to the user stays shown.
+
 **Return value — keep the agent going:**
 
 ```python
