@@ -431,7 +431,15 @@ cadence, or run a "cron librarian" job that reconciles the whole table
   its `cron/output/<job_id>/` directory are gone afterwards and the final run
   is not written there. Deleting the record from *outside* the run (another
   process, or a replacement job reusing the id) still discards the stale
-  run's output, as before.
+  run's output, as before. A child process of the run (a terminal command, the
+  job's script, or a `hermes cron remove` they start) cannot share the
+  run-local permission, so removing the run's own job from there is refused
+  before the record or output is touched, in-process and restart-safe worker
+  runs alike: the command exits non-zero and the run goes on and delivers.
+  Pause the job (`hermes cron pause <id>`) to stop future runs, then remove
+  it from an independent session after the current run finishes; a
+  `--repeat 1` job ends by itself. `cron.refuse_self_removal: false` turns
+  the refusal off.
 
 Prefer prompts that update existing jobs (list first, then update by ID)
 over ones that create new jobs each run.

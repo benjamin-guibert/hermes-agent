@@ -282,9 +282,11 @@ def _run_identified(run_job, job, execution_id, **kwargs):
     the caller entered (so the row and the profile name are this profile's)."""
     from cron.execution_identity import enter_cron_execution, exit_cron_execution
     from cron.executions import get_execution
+    from cron.jobs_removal import run_identity_scope
     token = enter_cron_execution(job, execution_id, get_execution(execution_id) or {})
     try:
-        return run_job(job, execution_id=execution_id, **kwargs)
+        with run_identity_scope(execution_id):  # its children cannot remove this job
+            return run_job(job, execution_id=execution_id, **kwargs)
     finally:
         exit_cron_execution(token)
 
