@@ -1855,6 +1855,8 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         if exit != 0) / off."""
         from tools.process_registry import process_registry
         from tools.process_registry_notifications import format_process_notification, should_surface_notification
+        from gateway.run_notifications_process_notice import (
+            completion_committed, mark_death_notice, owed_death_notice, refused_while_stopping, settle_owed_notice)
         session_id = watcher["session_id"]
         interval = watcher["check_interval"]
         platform_name = watcher.get("platform", "")
@@ -1870,7 +1872,8 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         retry_interval = interval
         while True:
             await asyncio.sleep(retry_interval)
-            session = process_registry.get(session_id)
+            # A re-armed notice carries its exited snapshot (one profile's receipt, see restore).
+            session = watcher.get("dead_session") or process_registry.get(session_id)
             if session is None:
                 break
             surface = should_surface_notification({
@@ -1891,10 +1894,14 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             has_new_output = current_output_len > last_output_len
             last_output_len = current_output_len
             if session.exited:
+                # An owed death notice (lifecycle kill) is delivered despite the sweep's forced consume mark.
+                death = owed_death_notice(watcher, session)
                 # Agent-notify: inject a synthetic message unless the agent already consumed the result via
                 # wait/log (poll() is read-only and deliberately does NOT mark consumed).
-                if agent_notify and not process_registry.is_completion_consumed(session_id):
+                if agent_notify and (death or not process_registry.is_completion_consumed(session_id)):
                     completion_evt = self._build_process_completion_event(watcher, session, session_id)
+                    if death:
+                        mark_death_notice(completion_evt, session)
                     synth_text = format_process_notification(completion_evt)
                     if not synth_text:
                         break
@@ -1902,12 +1909,15 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                     # turn itself installs the guard).
                     turn_busy = await self._launching_turn_active(platform_name, watcher)
                     delivered = await self._enqueue_process_completion_notification(synth_text, completion_evt)
-                    if delivered is not False:
+                    if delivered is False and refused_while_stopping(self, session_id):
+                        return  # Owed on disk: the next start replays it.
+                    # An owed death notice dropped without delivery falls through to the plain notice.
+                    if delivered is True or (delivered is None and not death):
                         # The agent normally reports the result itself, so the chat gets no separate
                         # receipt. While the launching turn is still running the injection only queues a
                         # follow-up, and the chat would stay mute for as long as that turn lasts
                         # (#112033): send the concise receipt now.
-                        if turn_busy and (notify_mode in {"concise", "all", "result"} or (
+                        if turn_busy and not death and (notify_mode in {"concise", "all", "result"} or (
                             notify_mode == "error" and session.exit_code not in {0, None}
                         )):
                             message_text = self._format_process_final_message(session_id, session, "concise")
@@ -1916,46 +1926,35 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                     # A refusal may clear (adapter reconnecting, store draining), so retry with backoff
                     # for a few minutes, then fall through to the plain notice instead of dropping it.
                     completion_attempts += 1
-                    if completion_attempts < _MAX_COMPLETION_INJECTION_ATTEMPTS:
+                    if delivered is False and completion_attempts < _MAX_COMPLETION_INJECTION_ATTEMPTS:
                         retry_interval = jittered_backoff(
                             completion_attempts, base_delay=max(interval, 1) * 2,
                             max_delay=_COMPLETION_INJECTION_RETRY_MAX_DELAY, jitter_ratio=0.0)
                         continue
-                    if (getattr(self, 'session_authority', None) is not None
-                            and self._completion_delivery_identity(completion_evt) is not None):
-                        from gateway.session_automation import completion_admission
-                        try:
-                            # The owning profile's authority, as on the delivery path.
-                            async with self._completion_event_scope(completion_evt):
-                                committed = completion_admission(self, completion_evt) is not None
-                        except Exception:
-                            # Failing open sends the notice; a dead watcher would send nothing.
-                            logger.debug("Process watcher: admission recheck failed for %s", session_id,
-                                         exc_info=True)
-                            committed = False
-                        if committed:
-                            break  # The last refusal was a lost ACK: the turn is committed.
+                    if delivered is False and await completion_committed(self, completion_evt, session_id):
+                        break  # The last refusal was a lost ACK: the turn is committed.
                     logger.warning(
                         "Process watcher: completion for %s was refused %d times; falling back to the "
                         "notify_mode=%s notice", session_id, completion_attempts, notify_mode,
                     )
                 # Text-only notification; skip when already consumed via wait/log (the agent_notify branch
                 # FALLS THROUGH here, hence the re-check).
-                if process_registry.is_completion_consumed(session_id):
+                if not death and process_registry.is_completion_consumed(session_id):
                     logger.debug(
                         "Process watcher: completion for %s already consumed "
                         "via wait/log — skipping raw notification (#65379)", session_id,
                     )
                     break
-                if notify_mode in {"concise", "all", "result"} or (
+                if death or notify_mode in {"concise", "all", "result"} or (
                     notify_mode == "error" and session.exit_code not in {0, None}
                 ):
-                    message_text = self._format_process_final_message(session_id, session, notify_mode)
+                    message_text = (format_process_notification(completion_evt) if death and agent_notify
+                                    else self._format_process_final_message(session_id, session, notify_mode))
                     from gateway.warning_notifications import present_notification
                     # Non-zero exit is the automatic diagnostic; a clean completion is the requested result.
                     await present_notification(
                         lambda: self._send_watcher_message(platform_name, chat_id, thread_id, message_text, watcher),
-                        platform=platform_name, diagnostic=session.exit_code not in {0, None})
+                        platform=platform_name, diagnostic=death or session.exit_code not in {0, None})
                 break
             elif has_new_output and notify_mode == "all" and not agent_notify:
                 # New output — deliver a status update (only in "all" mode; agent_notify watchers
@@ -1963,4 +1962,5 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                 await self._send_watcher_message(
                     platform_name, chat_id, thread_id, self._format_process_running_message(session), watcher,
                 )
+        settle_owed_notice(watcher, session)
         logger.debug("Process watcher ended%s: %s", " (silent)" if silent else "", session_id)

@@ -2063,7 +2063,7 @@ DEFAULT_CONFIG = {
         # platform send; a gateway that died between finalize and platform ACK redelivers on next
         # boot (ambiguous cases carry a "recovered reply — may be a duplicate" marker;
         # at-least-once). Disable to lose in-flight final responses on crash/restart.
-        "delivery_ledger": True,
+        "delivery_ledger": True, "process_notice_replay": True,  # the 2nd: owed process notices survive a restart
         # Seconds the gateway waits for a single messaging platform to finish connecting during startup (and
         # on reconnect). Discord in particular can blow past the old fixed 30s when an account has many
         # slash commands to sync (#19776: 90-173 skills → ~28-31s sync). Raise this if your gateway hits
