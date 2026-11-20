@@ -54,3 +54,19 @@ def _fast_retry_backoff(request, monkeypatch):
     # server-error retries don't burn real wall-clock seconds.
     from agent import retry_utils as _retry_utils
     monkeypatch.setattr(_retry_utils, "jittered_backoff", lambda *a, **k: 0.0)
+
+
+# The reply-hold carry's file is checked byte for byte by the carry-patch audit, so its test that
+# pins the shown draft after an edit cannot be edited: the reply-hold-edits carry reverses that
+# behaviour (test_pre_verify_all_replies_edits.py). Strict: it fails again if that fix is off.
+_SUPERSEDED = {
+    "test_pre_verify_all_replies.py::test_after_an_edit_the_draft_is_still_shown_with_the_key_on":
+        "reply-hold-edits carry: a draft after an edit is hidden with pre_verify_all_replies",
+}
+
+
+def pytest_collection_modifyitems(items):
+    for item in items:
+        reason = _SUPERSEDED.get(item.nodeid.rsplit("/", 1)[-1])
+        if reason:
+            item.add_marker(pytest.mark.xfail(reason=reason, strict=True))

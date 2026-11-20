@@ -117,6 +117,16 @@ def _late_lsp_verdicts(agent) -> Optional[str]:
             + body)
 
 
+def _reply_check_hides_edited_draft(agent, final_response) -> bool:
+    """With ``agent.pre_verify_all_replies`` the ``pre_verify`` hook judges the reply itself, so a
+    draft it sends back on a turn with file edits is hidden like one on a turn without: interim
+    commentary would post it, and the rewrite after it. A draft already streamed is on screen."""
+    from agent.verify_hooks import pre_verify_all_replies
+
+    return bool(getattr(agent, "_turn_file_mutation_paths", None)) and pre_verify_all_replies() and (
+        not agent._interim_content_was_streamed(final_response or ""))
+
+
 def _append_interim_answer(agent, final_msg, messages, conversation_history, flush_fail_msg: str) -> None:
     """Real content: persist and emit as interim so the user sees the attempted answer;
     only the nudge is flagged synthetic (#65919). A held turn's answer (typed hidden) is not shown
@@ -189,6 +199,13 @@ def apply_stop_gates(
 
     _attempt = getattr(agent, "_pre_verify_nudges", 0)
     _verify_nudge2 = _pre_verify_nudge(agent, final_response, _attempt)
+    if _verify_nudge2 and _reply_check_hides_edited_draft(agent, final_response):
+        # Kept for the model, flushed with the turn: the budget fallback can still publish it.
+        agent._pre_verify_nudges = _attempt + 1
+        final_msg.update(finish_reason="verify_hook_continue", display_kind="hidden")
+        append_message(messages, final_msg)
+        logger.debug("pre_verify nudge issued, draft after edits hidden (attempt %d)", agent._pre_verify_nudges)
+        return _continue(_verify_nudge2, "_pre_verify_synthetic")
     if _verify_nudge2:
         agent._pre_verify_nudges = _attempt + 1
         final_msg["finish_reason"] = "verify_hook_continue"
