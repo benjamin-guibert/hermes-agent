@@ -168,6 +168,44 @@ class TestGatewayConnectionErrorReply:
         assert _sanitize_gateway_final_response("local", raw_reset) == raw_reset
 
 
+class TestHttpStatusEnvelopeShape:
+    """Only an HTTP failure status marks a provider envelope (#149547)."""
+
+    def test_good_reply_leading_with_http_200_reaches_the_user(self):
+        reply = "HTTP 200: the helper has started the run. When its answer arrives, I will check it."
+
+        assert _sanitize_gateway_final_response(Platform.TELEGRAM, reply) == reply
+
+    @pytest.mark.parametrize("reply", [
+        "✅ **HTTP 202** — accepted, the card was posted.",
+        "HTTP 200 OK",
+        "HTTP 301 — the docs moved to /v2/guide.",
+        "HTTP 101 Switching Protocols: the socket is open.",
+        "**HTTP 304** — nothing changed since the last check.",
+    ])
+    def test_reply_leading_with_a_non_failure_status_reaches_the_user(self, reply):
+        assert _sanitize_gateway_final_response(Platform.TELEGRAM, reply) == reply
+
+    @pytest.mark.parametrize("envelope", [
+        "HTTP 429: rate limit exceeded for this model",
+        "HTTP 401: Unauthorized",
+        "HTTP 500 internal server error",
+        "HTTP 503 — Service Unavailable",
+    ])
+    def test_short_reply_leading_with_a_failure_status_is_still_replaced(self, envelope):
+        sanitized = _sanitize_gateway_final_response(Platform.TELEGRAM, envelope)
+
+        assert sanitized == _gateway_provider_error_reply(envelope)
+        assert sanitized != envelope
+
+    def test_error_code_envelope_is_still_replaced(self):
+        envelope = "Error code: 529 - {'type': 'error', 'error': {'type': 'overloaded_error'}}"
+        sanitized = _sanitize_gateway_final_response(Platform.TELEGRAM, envelope)
+
+        assert sanitized == _gateway_provider_error_reply(envelope)
+        assert sanitized != envelope
+
+
 class TestQuotaExhaustedIsNotAnAuthFailure:
     """A 429/quota envelope must never send the user to re-authenticate valid credentials, and a
     long reset window must be named instead of "wait a moment" (#89401)."""
