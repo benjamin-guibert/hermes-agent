@@ -56,7 +56,7 @@ def test_force_install_waits_for_incumbent_then_retries_until_supervised(tmp_pat
     gateway_cli.launchd_install(force=True)
 
     assert ("run", ["launchctl", "bootout", f"{DOMAIN}/{LABEL}"]) in events
-    wait_index = events.index(("wait", 4242, 45.0))
+    wait_index = events.index(("wait", 4242, 70.0))  # ExitTimeOut 60 + 10 s, past the 45 s drain
     retry_index = next(i for i, event in enumerate(events) if event[0] == "retry")
     assert wait_index < retry_index
     assert plist.read_text(encoding="utf-8") == "<new/>"

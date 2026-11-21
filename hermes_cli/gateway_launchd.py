@@ -143,6 +143,20 @@ def _launchd_reload_budget() -> float:
     return max(30.0, _gw()._get_restart_drain_timeout())
 
 
+_OLD_GATEWAY_EXIT_MARGIN_S = 10.0  # SIGKILL delivery and reaping after ExitTimeOut, plus the 1s poll
+
+
+def _launchd_old_gateway_wait(budget: float) -> float:
+    """Seconds to wait, from the bootout, for the old gateway to exit; never less than *budget*.
+
+    launchd SIGKILLs the old gateway ExitTimeOut after the bootout's SIGTERM, so the wait covers
+    ExitTimeOut plus a margin: a shorter wait bootstrapped beside a live owner, whose start then
+    attached. The generated plist writes 60 and the gui domain clamps any value to 60, so the clamp
+    is the live bound without a ``launchctl print`` on a loaded host."""
+    from gateway.restart import LAUNCHD_GUI_EXIT_TIMEOUT_CLAMP_S
+    return max(budget, LAUNCHD_GUI_EXIT_TIMEOUT_CLAMP_S + _OLD_GATEWAY_EXIT_MARGIN_S)
+
+
 def _launchctl_supervised_pid(label: str) -> int | None:
     """PID launchd currently runs for ``label``, or None when it runs none. ``launchctl list`` exits 0 for
     a mere registered definition (``state = not running`` on macOS 26+), so a PID — not the exit code — is
@@ -540,6 +554,7 @@ def _spawn_deferred_launchd_reload(
     _gw()._append_launchd_reload_log(f"Launchd reload helper started for {target}")
 
     _reload_budget = int(_launchd_reload_budget())
+    _old_wait = int(_launchd_old_gateway_wait(_reload_budget))
     q_target, q_label, q_log = shlex.quote(target), shlex.quote(label), shlex.quote(str(reload_log_path))
     stamp = "$(date '+%Y-%m-%d %H:%M:%S %z')"
     # Require a POSITIVE PID: `launchctl list` also exits 0 for a registered-but-not-running
@@ -551,9 +566,9 @@ def _spawn_deferred_launchd_reload(
         f"sleep 2; "
         f"launchctl bootout {q_target} 2>/dev/null; "
         # Wait for the OLD gateway to exit: bootout only SIGTERMs and every bootstrap during the drain fails EIO.
-        f"_wait_deadline=$(($(date +%s) + {_reload_budget})); "
+        f"_wait_deadline=$(($(date +%s) + {_old_wait})); "
         f"while kill -0 {gateway_pid} 2>/dev/null; do   if [ $(date +%s) -ge $_wait_deadline ]; then "
-        f"    echo \"[{stamp}] old gateway pid {gateway_pid} still alive after {_reload_budget}s drain wait — bootstrapping anyway\" >> {q_log}; "
+        f"    echo \"[{stamp}] old gateway pid {gateway_pid} still alive after {_old_wait}s drain wait — bootstrapping anyway\" >> {q_log}; "
         f"    break;   fi;   sleep 1; done; "
         # Let launchd finish unregistering the label after the process exits.
         f"sleep 1; _deadline=$(($(date +%s) + {_reload_budget})); while :; do "
@@ -604,10 +619,11 @@ def _bootout_drain_and_rebootstrap(domain, plist_path, label, old_pid, budget: f
     """
     target = f"{domain}/{label}"
     subprocess.run(["launchctl", "bootout", target], check=False, timeout=90, **_gw()._CAPTURE_TEXT)
-    if old_pid is not None and not _gw()._wait_for_pid_exit(old_pid, budget):
+    old_wait = _launchd_old_gateway_wait(budget)
+    if old_pid is not None and not _gw()._wait_for_pid_exit(old_pid, old_wait):
         _gw()._append_launchd_reload_log(
             f"old gateway pid {old_pid} still alive after "
-            f"{int(budget)}s drain wait — bootstrapping {target} anyway"
+            f"{int(old_wait)}s drain wait — bootstrapping {target} anyway"
         )
     return _gw()._retry_launchctl_bootstrap_until_registered(
         domain, plist_path, label, deadline=time.monotonic() + budget)

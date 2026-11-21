@@ -1513,6 +1513,7 @@ DEFAULT_CONFIG = {
             "max_attempts": 3,  # lifetime re-dispatch cap for one message, whatever its outcome
         },
         "stop_replay": True,  # replay what a planned stop refused/dropped; skipped if the stop is >30 min old
+        "stop_replay_write_off_loop": True,  # write the stop-replay window on a worker, coalesced; false = one write per refusal on the event loop
         "reactions": True,  # add 👀/✅/❌ reactions to messages during processing
         # Gateway transport health probe: inspects the WebSocket's ready/open/heartbeat state (never
         # REST) as proof events still arrive. Any value 0 disables it.
@@ -2059,6 +2060,7 @@ DEFAULT_CONFIG = {
         "unmanaged_idle_exit_seconds": 600,  # client-auto-started gateway only; 0 disables
         # Seconds a SIGTERM-interrupted agent unwinds before teardown (short: service stop budgets).
         "signal_interrupt_grace_timeout": 1,
+        "supervised_attach_retry": True,  # a supervised start beside a live host gateway exits 75 (retry), not 0 (launchd parks it)
         "service_install_choice": None,  # null | install | decline; never authorizes ordinary launch installation.
         # Durable delivery-obligation ledger: final responses are recorded in state.db around the
         # platform send; a gateway that died between finalize and platform ACK redelivers on next

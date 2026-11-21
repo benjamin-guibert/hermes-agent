@@ -244,6 +244,7 @@ async def test_a_held_message_is_not_replayed_or_readmitted_afterwards(make_harn
     replayed = SimpleNamespace(id=1001, channel=channel, created_at=dt.datetime.now(dt.UTC))
     assert await new._replay_one(replayed) is False  # a resume / recovery replay of the same message
     new.set_message_handler(None)  # a planned stop right after: its window must skip the message
+    await new.cancel_background_tasks()  # the teardown: the window is on disk when it returns
     state = json.loads((get_hermes_home() / "gateway" / "discord_stop_replay.json").read_text())
     assert "1001" in state["skip"] and "1001" not in state["deferred"]
     assert await all_turns(h, 1) == ["wake up"]

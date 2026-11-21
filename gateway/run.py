@@ -4956,10 +4956,8 @@ async def _host_attach_or_none(replace: bool, force: bool = False) -> Optional[b
 
     decision = decide(get_hermes_home(), replace=replace)
     if decision.outcome == ATTACH:
-        logger.info("Attaching to the host gateway instead of starting a second one: %s",
-                    decision.owner.describe() if decision.owner else "unknown")
-        print(decision.message)
-        return True
+        from gateway.supervised_attach import attach_or_retry
+        return attach_or_retry(decision)
     if decision.outcome == REFUSE:
         logger.error("Refusing to start a second gateway on this host: %s",
                      decision.owner.describe() if decision.owner else "unknown")
