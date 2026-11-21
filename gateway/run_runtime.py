@@ -717,6 +717,8 @@ async def recover_profile_native_sessions(runner, authority):
                     for owner in [authority.logical_owner(entry.session_id)] if owner in pending
                     for origin in [recovered_native_source(runner, authority, entry, owner)]]
         _prime_recovered_egress(bindings)
+        from gateway.session_lost_chat_turn import send_owed_lines
+        await send_owed_lines(runner, authority)  # before the queued messages it announces run
         outcome = await authority.recover_native_sessions(bindings)
         from gateway.session_detached import recover_detached_sessions
         outcome.update(dict.fromkeys(recover_detached_sessions(authority, pending - set(outcome)), 'detached'))

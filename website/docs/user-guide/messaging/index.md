@@ -283,6 +283,10 @@ Sessions persist across messages until they reset. The agent remembers your conv
 
 A `/model` switch in a gateway chat applies to that session and now **survives gateway restarts**: the model/provider choice is persisted to the session store and rehydrated on first use after a restart (credentials are re-resolved at load time and never written to disk). `/model reset` clears the override and keeps the conversation, `/new` (or `/reset`) clears it with a fresh conversation, and `/model <name> --global` writes it through to `config.yaml` instead. `/model <name> --once` applies for a single turn only.
 
+### A Turn Lost in a Restart
+
+A restart (or a lost worker) can cut a turn in the middle. That turn is never re-run, because some of its steps may already have run. In a messaging chat Hermes settles it the way `/discard` does: it records the turn as interrupted, tells the next turn to check the real state (files, sent messages, jobs) before it continues, posts one short line in the chat, and then answers the messages that came after it, in order. Set `gateway.messaging_auto_discard_lost_turns: false` to keep the conversation paused until you send `/discard` or `/reset`. Desktop, the TUI and the API always keep the pause.
+
 ### Delivery Reliability
 
 Final agent responses are recorded in a durable **delivery ledger**

@@ -42,6 +42,8 @@ async def test_discard_after_resume_into_a_cold_conversation_resolves_its_lost_t
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
     monkeypatch.setenv('TELEGRAM_ALLOWED_USERS', '42')
     monkeypatch.setattr('gateway.run._hermes_home', tmp_path)
+    # The manual /discard path: with the switch on, boot settles the lost chat turn by itself.
+    (tmp_path / 'config.yaml').write_text('gateway:\n  messaging_auto_discard_lost_turns: false\n')
     runner = GatewayRunner(GatewayConfig(multiplex_profiles=False, sessions_dir=tmp_path / 'sessions'))
     adapter = _StubAdapter(PlatformConfig(enabled=True, token='fixture', typing_indicator=False), Platform.TELEGRAM)
     sent = []
