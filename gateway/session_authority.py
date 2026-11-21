@@ -63,6 +63,8 @@ class LiveSession:
     # The messaging ingress tells the platform user once per pause episode (unknown head,
     # preflight refusal), not per message; the drain clears it when the FIFO moves again.
     pause_notified: bool = False
+    # The head was refused ``not_found`` in a messaging chat: its adapter's connect drains it again.
+    awaits_adapter: bool = False
     # Failed-delegation wakes run in a row with no viewer (session_completion_notes.UNATTENDED_WAKE_LIMIT).
     unattended_wakes: int = 0
     mutation_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -1291,10 +1293,10 @@ class SessionAuthority:
                     row, first = await self._claim_next(ref, live)
                 except AuthorityRefusal as exc:
                     if exc.reason == 'unknown_execution':
-                        # An automation turn nobody is waiting on settles interrupted (GW-10); only a
-                        # person's lost turn keeps the FIFO paused for them to resolve.
-                        from gateway.session_unattended_unknown import settle_unattended_unknown
-                        if await settle_unattended_unknown(self, ref):
+                        # An automation turn nobody is waiting on settles interrupted (GW-10), and so does
+                        # a person's turn from a messaging chat (like /discard); other surfaces stay paused.
+                        from gateway.session_lost_chat_turn import settle_lost_unknown
+                        if await settle_lost_unknown(self, ref):
                             continue
                     if exc.reason == 'admission_conflict':
                         # A verdict on the head alone (its route or binding moved under it) that every drain
@@ -1314,6 +1316,8 @@ class SessionAuthority:
                     import logging
                     from gateway.session_local_recovery import _refused_check
                     logging.getLogger(__name__).warning('Session %s paused: %s', ref.session_id, _refused_check(exc))
+                    from gateway.session_lost_chat_turn import adapter_pause_heals
+                    live.awaits_adapter = exc.reason == 'not_found' and await adapter_pause_heals(self, live)
                     self._pause(ref, exc.reason)
                     return None
             except (CorruptStoreError, StoreReplaced):
@@ -1367,9 +1371,10 @@ class SessionAuthority:
             self.pending_steers.pop(ref.session_id, None)
             self.adopted.pop(ref.session_id, None)
             # An automation turn nobody waits on settles here, at the exit that fenced it (GW-10),
-            # so the followers already queued run in this drain; a person's turn still pauses.
-            from gateway.session_unattended_unknown import settle_unattended_unknown
-            if await settle_unattended_unknown(self, ref):
+            # so the followers already queued run in this drain; so does a messaging chat's person
+            # turn (like /discard). Other surfaces' person turns still pause.
+            from gateway.session_lost_chat_turn import settle_lost_unknown
+            if await settle_lost_unknown(self, ref):
                 return None, 'settled_unknown'
             self._pause(ref, 'unknown_execution')
             raise
@@ -1536,6 +1541,8 @@ async def initialize_session_authority(runner, *, profile_id, instance_id, persi
     # A lost automation turn has nobody to resolve it: it settles interrupted before any FIFO runs.
     from gateway.session_unattended_unknown import settle_recovered_unattended
     await asyncio.to_thread(settle_recovered_unattended, persistence, epoch)
+    from gateway.session_lost_chat_turn import settle_recovered_chat_turns
+    lost_chat_lines = await asyncio.to_thread(settle_recovered_chat_turns, persistence, epoch)
     await asyncio.to_thread(backfill_legacy_session_owners, persistence)
     await asyncio.to_thread(backfill_compression_created_sources, persistence)
     from gateway.session_local_recovery import release_handed_off_receipts
@@ -1544,6 +1551,7 @@ async def initialize_session_authority(runner, *, profile_id, instance_id, persi
     await asyncio.to_thread(release_superseded_bot_chat_at_boot, persistence, runner.session_store)
     authority = SessionAuthority(runner, profile_id=profile_id, instance_id=instance_id, epoch=epoch,
                                  persistence=persistence)
+    authority.lost_chat_lines = lost_chat_lines  # posted once the adapters connect (recover_profile_native_sessions)
     # A receipt's compression catch-up (#140060) writes: it commits off the loop too, before the
     # authority is published, so the recovery below only reads.
     from gateway.session_local_adoption import adopt_local_compressions

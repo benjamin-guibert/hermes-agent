@@ -260,7 +260,9 @@ if __name__ == "__main__":
         f"model:\n  default: local-wire-stub\n  provider: custom\n  base_url: {base_url}\n"
         f"auxiliary:\n  title_generation:\n    enabled: false\nterminal:\n  cwd: {os.environ['HERMES_HOME']}\n"
         # The durable-FIFO proof needs queue semantics; interrupt mode redirects the running turn.
-        "display:\n  busy_input_mode: queue\n")
+        "display:\n  busy_input_mode: queue\n"
+        # The pause contract for a lost turn; with the switch on, boot settles a chat turn by itself.
+        "gateway:\n  messaging_auto_discard_lost_turns: false\n")
     status = 0
     try:
         asyncio.run(probe())

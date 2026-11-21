@@ -272,6 +272,9 @@ def pause_notice(authority, ref, reason):
     if reason == 'session_busy':
         # Transient: queued behind work already running on this conversation (a worker execution).
         return '⏳ Your message is saved and will be answered when the work running in this conversation finishes.'
+    if reason == 'not_found' and getattr(live, 'awaits_adapter', False):
+        # Transient: the chat's connection dropped or is not back yet; its connect drains the FIFO again.
+        return '⏳ The connection to this chat dropped — your message is saved and will be answered when it is back.'
     if reason == 'unknown_execution':
         # GW-10: the way out is in this chat. /discard acknowledges the lost turn (never replayed)
         # through the same fenced resolve_unknown as Desktop/TUI, and the saved messages then run.
