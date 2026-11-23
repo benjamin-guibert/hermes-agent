@@ -11,7 +11,7 @@ _IMAGE_EXTS = frozenset({'.jpg', '.jpeg', '.png', '.webp', '.gif'})
 
 def _send_media_via_adapter(
     adapter, chat_id: str, media_files: list, metadata: dict | None, loop, job: dict, platform=None,
-    *, force_document: bool = False,
+    *, force_document: bool = False, record_delivery=None,
 ) -> list:
     """Send MEDIA files as native attachments (routed by extension, as in
     _process_message_background). ``force_document`` (``[[as_document]]``) sends images as
@@ -65,6 +65,8 @@ def _send_media_via_adapter(
             except TimeoutError:
                 future.cancel()
                 raise
+            if record_delivery is not None:
+                record_delivery(result)
             raw = getattr(result, "raw_response", None)
             if result and getattr(result, "success", False) and isinstance(raw, dict) and raw.get("ambiguous"):
                 # Sent but the ack was lost: possibly delivered, so never an error (a re-run

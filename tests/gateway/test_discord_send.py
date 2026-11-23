@@ -126,6 +126,7 @@ async def test_send_retries_without_reference_when_reply_target_is_deleted():
         return sent_msgs[len(send_calls) - 2]
 
     channel = SimpleNamespace(
+        id=555,
         fetch_message=AsyncMock(return_value=ref_msg),
         send=AsyncMock(side_effect=fake_send),
     )
@@ -145,7 +146,7 @@ async def test_send_retries_without_reference_when_reply_target_is_deleted():
     assert channel.send.await_count == 3
     # the reference is constructed from ids, not fetched + to_reference()
     _discord_mod.MessageReference.assert_any_call(
-        message_id=99, channel_id=None, guild_id=None,
+        message_id=99, channel_id=555, guild_id=None,
         fail_if_not_exists=False)
     assert send_calls[0]["reference"] is _discord_mod.MessageReference.return_value
     assert send_calls[1]["reference"] is None
@@ -290,6 +291,7 @@ async def test_send_video_uses_path_based_files_kwarg(tmp_path, monkeypatch):
         attachments=[SimpleNamespace(filename="clip.mp4", url="https://cdn.example/clip.mp4")],
     )
     channel = SimpleNamespace(
+        id=555,
         send=AsyncMock(return_value=sent_msg),
         type=0,
     )
@@ -328,7 +330,7 @@ async def test_send_video_fails_loud_when_message_has_no_attachments(tmp_path, m
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
     # Message id present, but no attachments — the silent-drop failure mode.
     sent_msg = SimpleNamespace(id=99, attachments=[])
-    channel = SimpleNamespace(send=AsyncMock(return_value=sent_msg), type=0)
+    channel = SimpleNamespace(id=555, send=AsyncMock(return_value=sent_msg), type=0)
     adapter._client = SimpleNamespace(
         get_channel=lambda _chat_id: channel,
         fetch_channel=AsyncMock(),

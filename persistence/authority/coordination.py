@@ -597,12 +597,20 @@ class CoordinationRepository(SubagentLedger, Protocol):
         """State ``attempting``, ``updated_at`` now, error cleared."""
         ...
 
-    def mark_obligation_delivered(self, *, obligation_id: str) -> None:
+    def mark_obligation_delivered(self, *, obligation_id: str, delivery_receipt: Optional[str] = None) -> None:
         """State ``delivered``, ``updated_at`` now, error cleared."""
         ...
 
-    def mark_obligation_failed(self, *, obligation_id: str, error: str = '') -> None:
+    def mark_obligation_failed(self, *, obligation_id: str, error: str = '', delivery_receipt: Optional[str] = None) -> None:
         """State ``failed``, ``updated_at`` now, ``last_error`` ``error[:500]`` or NULL."""
+        ...
+
+    def set_obligation_receipt(self, *, obligation_id: str, delivery_receipt: str) -> None:
+        """Checkpoint progress without changing obligation identity, state or owner."""
+        ...
+
+    def get_obligation_receipt(self, *, obligation_id: str) -> Optional[str]:
+        """Return the recorded actual destination/progress, or None for a legacy obligation."""
         ...
 
     def release_runtime_obligation_claim(self, *, obligation_id: str, error: str = '', owner: OwnerStamp) -> bool:

@@ -12,7 +12,12 @@ best-effort: ledger failures must never block a send; callers wrap every call in
 
 from __future__ import annotations
 
+from contextvars import ContextVar
+
+current_delivery_obligation = ContextVar("current_delivery_obligation", default=None)
+
 import hashlib
+import json
 import logging
 import os
 import re
@@ -263,14 +268,65 @@ def mark_attempting(obligation_id: str) -> None:
         store.coordination.mark_obligation_attempting(obligation_id=obligation_id)
 
 
-def mark_delivered(obligation_id: str) -> None:
+def mark_delivered(obligation_id: str, delivery_receipt: Optional[str] = None) -> None:
     with _DB_LOCK, _store() as store:
-        store.coordination.mark_obligation_delivered(obligation_id=obligation_id)
+        store.coordination.mark_obligation_delivered(obligation_id=obligation_id, **({"delivery_receipt": delivery_receipt} if delivery_receipt is not None else {}))
 
 
-def mark_failed(obligation_id: str, error: str = "") -> None:
+def mark_failed(obligation_id: str, error: str = "", delivery_receipt: Optional[str] = None) -> None:
     with _DB_LOCK, _store() as store:
-        store.coordination.mark_obligation_failed(obligation_id=obligation_id, error=error)
+        store.coordination.mark_obligation_failed(obligation_id=obligation_id, error=error, **({"delivery_receipt": delivery_receipt} if delivery_receipt is not None else {}))
+
+
+def guarded_progress_receipt(receipt: str) -> bool:
+    try:
+        raw = json.loads(receipt)
+    except (TypeError, ValueError):
+        return True
+    return not isinstance(raw, dict) or bool(set(raw) & {
+        "progress_contract", "origin_thread_id", "remaining_chunks", "resume_safe", "partial_overflow"})
+
+
+def checkpoint_delivery_progress(obligation_id: str, progress: dict) -> None:
+    """Persist plugin progress before a POST and after its acknowledgement.
+
+    Plugins use the current task's ``current_delivery_obligation`` binding:
+    (obligation ID, task, explicitly disabled). A missing ID is safe only when
+    disabled is true. Storage errors propagate; a guarded send must then stop.
+    The plugin owns and validates its versioned progress format on recovery.
+    """
+    with _DB_LOCK, _store() as store:
+        store.coordination.set_obligation_receipt(
+            obligation_id=obligation_id, delivery_receipt=json.dumps(progress))
+        saved = store.coordination.get_obligation_receipt(obligation_id=obligation_id)
+        if saved != json.dumps(progress):
+            raise RuntimeError("Delivery progress checkpoint was not stored")
+
+
+def checkpoint_recovered_attempt(obligation_id: str, receipt: str) -> None:
+    try:
+        progress = json.loads(receipt)
+    except (TypeError, ValueError):
+        return
+    if not isinstance(progress, dict) or progress.get("resume_safe") is not True:
+        return
+    progress["resume_safe"] = False
+    with _DB_LOCK, _store() as store:
+        store.coordination.set_obligation_receipt(
+            obligation_id=obligation_id, delivery_receipt=json.dumps(progress))
+
+
+def get_delivery_receipt(obligation_id: str) -> Optional[str]:
+    with _DB_LOCK, _store() as store:
+        return store.coordination.get_obligation_receipt(obligation_id=obligation_id)
+
+
+def receipt_json(result) -> Optional[str]:
+    raw = getattr(result, "raw_response", None)
+    if not isinstance(raw, dict) or "chat_id" not in raw:
+        return None
+    return json.dumps({key: raw[key] for key in (
+        "chat_id", "thread_id", "message_ids", "remaining_chunks", "resume_safe", "partial_overflow", "progress_contract", "origin_thread_id") if key in raw})
 
 
 def release_runtime_claim(obligation_id: str, error: str = "") -> bool:

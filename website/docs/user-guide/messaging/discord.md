@@ -382,6 +382,7 @@ discord:
   free_response_auto_thread: false # If true, free_response_channels also auto-thread (default: inline)
   reactions: true                 # Add emoji reactions during processing
   skip_status_in_archived_threads: true  # Status notices never reopen an archived thread
+  redirect_archived_thread_messages: true  # Send closed-thread messages to the parent channel
   ignored_channels: []            # Channel IDs where bot never responds
   no_thread_channels: []          # Channel IDs where bot responds without threading
   history_backfill: true          # Prepend recent channel scrollback on mention (default: true)
@@ -493,7 +494,35 @@ Disable this if you find the reactions distracting or if the bot's role doesn't 
 
 Discord reopens an archived thread when a message is posted to it. With this option on, Hermes does not post status notices into a thread that is archived: tool-progress lines, the "Working — N min" heartbeat, the background review summary (`💾 Self-improvement review: …`), and restart or update notices. A notice that is skipped logs one INFO line and counts as delivered, so it is not retried.
 
-Replies of the agent still go to an archived thread and reopen it, because a reply means the work continues. Hermes reads the archived state that Discord pushes over the gateway connection and makes no extra API call; when that state is not known, the notice is sent. Set `false` to post status notices into archived threads again.
+This option controls marked status notices. If it is `false`, these notices follow
+`discord.redirect_archived_thread_messages`. The two options are independent.
+
+#### `discord.redirect_archived_thread_messages`
+
+**Type:** boolean — **Default:** `true`
+
+Hermes keeps archived Discord threads closed. Bot messages, cron results and
+`hermes send` messages go to the thread's parent channel as a new top-level post.
+The post contains a link to the original thread and the original text. It keeps
+original mentions and media. The configured home channel does not replace the
+parent channel.
+
+A normal final reply can stay in an archived thread only when its current trigger
+is a genuine human post in that exact thread, created strictly after the current
+archive time. Bot, webhook, recovery and internal events do not grant this
+permission. A later archive cancels an earlier permission. Active threads keep
+normal reply routing.
+
+Hermes checks thread state once per logical delivery. If it cannot confirm the
+state or resolve a valid parent, delivery fails without posting to the thread.
+Marked status notices still use the successful skip policy above.
+
+This setting is local to each profile. Set it to `false` to restore earlier
+conversational routing. This does not disable `skip_status_in_archived_threads`.
+With the delivery ledger enabled, guarded text sends save progress before each
+post and after each acknowledgement. Recovery sends only a confirmed unsent
+suffix. An unknown remote outcome blocks automatic replay. An intentionally
+disabled delivery ledger does not block ordinary redirection.
 
 #### `discord.ignored_channels`
 

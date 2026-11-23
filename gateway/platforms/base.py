@@ -150,7 +150,7 @@ def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) 
 
 def _thread_metadata_for_event(event) -> dict | None:
     """``_thread_metadata_for_source`` for an event, anchored on its reply id."""
-    return _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
+    return event_reply_metadata(event, _thread_metadata_for_source(event.source, _reply_anchor_for_event(event)))
 
 
 def _mark_notify_metadata(metadata: dict | None) -> dict:
@@ -438,7 +438,7 @@ if (_checkout_root := str(Path(__file__).resolve().parents[2])) not in sys.path:
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.helpers import fence_state_after, reply_file_off, try_reply_file, typing_metadata_for_turn, sender_may_see_activity, typing_pause_key, typing_refresh_wanted
 from gateway.platforms.base_post_delivery import run_post_delivery_callback
-from gateway.platforms.base_delivery_ledger import finalize_final_obligation, ledger_attempted, ledger_bracket, record_final_obligation
+from gateway.platforms.base_delivery_ledger import final_reply_scope, finalize_final_obligation, ledger_attempted, ledger_bracket, record_final_obligation
 from gateway.final_delivery_claims import release_final_delivery
 from gateway.platforms.base_exec_approval import (
     approval_timeout_seconds, ea_action_labels, ea_default_reason_text, ea_header_text,
@@ -446,7 +446,7 @@ from gateway.platforms.base_exec_approval import (
     card_shows_whole_command, render_exec_approval)
 from gateway.platforms.base_streaming_tts import (
     AudioFormat, StreamingTTSHandle, streaming_tts_should_skip_whole_file, streaming_tts_turn_key)
-from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
+from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome, current_reply_trigger, event_reply_metadata
 from gateway.warning_notifications import diagnostic_wake_muted
 from hermes_cli.observability.shared_metrics_gateway import records_delivery, stop_reply_clock
 from hermes_cli.home_data_layout import CREDENTIAL_STORE_DIRS, HOME_ENV_FILES, SECRET_CACHE_STORES
@@ -3487,6 +3487,9 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
         """The runner's CURRENT adapter for a new final-response send: a reconnect can swap the
         registry adapter mid-task; an unsent final response belongs on the replacement transport,
         while message IDs, edits and deletes stay owned by the old one (nothing is migrated)."""
+        scope = current_reply_trigger.get()
+        if isinstance(scope, tuple) and len(scope) == 4 and scope[1] is asyncio.current_task():
+            return scope[2]
         resolve = getattr(self.gateway_runner, "_delivery_adapter_for", None)
         if not callable(resolve):
             return self
@@ -4072,7 +4075,8 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
         caption = None
         if first and self.platform == Platform.TELEGRAM and text_content and text_content[:1024] == text_content:
             caption = text_content
-        tts_result = await self.play_tts(
+        live = self._final_delivery_adapter(event.source)
+        tts_result = await live.play_tts(
             chat_id=event.source.chat_id, audio_path=tts_path, caption=caption, metadata=metadata)
         record_delivery(tts_result)
         return bool(caption and getattr(tts_result, "success", False))
@@ -4200,9 +4204,10 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
         self, event: MessageEvent, session_key: str, text_content: str, metadata: dict[str, Any],
         is_ephemeral_response: bool, ephemeral_ttl: int, record_delivery: Callable) -> None:
         """Normal-lane final: the ledger bracket plus the message-id owner's ephemeral delete."""
-        result, delivery_adapter = await self.send_final_ledgered(
-            event, session_key, text_content, metadata,
-            reply_to=_reply_anchor_for_event(event), is_ephemeral_response=is_ephemeral_response)
+        with final_reply_scope(self, event):
+            result, delivery_adapter = await self.send_final_ledgered(
+                event, session_key, text_content, metadata,
+                reply_to=_reply_anchor_for_event(event), is_ephemeral_response=is_ephemeral_response)
         record_delivery(result)
         if ephemeral_ttl and ephemeral_ttl > 0 and result.success and result.message_id:
             delivery_adapter._schedule_ephemeral_delete(event.source.chat_id, result.message_id, ephemeral_ttl)
@@ -4383,43 +4388,36 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
                 text_content, media_files = extracted.text_content, extracted.media_files
                 # Final content gets notify=True; typing metadata stays unmarked (thread-strict).
                 _final_thread_metadata = _mark_notify_metadata(_thread_metadata)
-                _tts_paths, _tts_requested_path = [], None
-                if self._wants_auto_tts(
-                        event, session_key, interrupt_event, text_content, media_files):
-                    _tts_paths, _tts_requested_path = await self._synthesize_auto_tts(text_content, event.source)
-                # TTS plays before text; generated files are removed afterwards.
-                _tts_caption_delivered = False
-                for _tts_index, _tts_path in enumerate(_tts_paths):
-                    try:
-                        _tts_caption_delivered |= await self._play_tts_file(
-                            event, text_content, _tts_path, _tts_index == 0, _final_thread_metadata,
-                            _record_delivery)
-                    finally:
+                with final_reply_scope(self, event):
+                    _tts_paths, _tts_requested_path = [], None
+                    if self._wants_auto_tts(
+                            event, session_key, interrupt_event, text_content, media_files):
+                        _tts_paths, _tts_requested_path = await self._synthesize_auto_tts(text_content, event.source)
+                    # TTS plays before text; generated files are removed afterwards.
+                    _tts_caption_delivered = False
+                    for _tts_index, _tts_path in enumerate(_tts_paths):
+                        try:
+                            _tts_caption_delivered |= await self._play_tts_file(
+                                event, text_content, _tts_path, _tts_index == 0, _final_thread_metadata,
+                                _record_delivery)
+                        finally:
+                            with contextlib.suppress(OSError):
+                                os.remove(_tts_path)
+                    if not _tts_paths and _tts_requested_path is not None:
                         with contextlib.suppress(OSError):
-                            os.remove(_tts_path)
-                if not _tts_paths and _tts_requested_path is not None:
-                    with contextlib.suppress(OSError):
-                        os.remove(_tts_requested_path)
-                # Suspend the typing refresh before the first delivery attempt, not just in
-                # the turn's finally (#117300): if the final send stalls (platform accepted it
-                # but the HTTP ack never returns), control never reaches the finally, and
-                # _keep_typing keeps refreshing sendChatAction forever while the agent is
-                # already idle and the user can read the answer. Reuse the existing
-                # _typing_paused mechanism: _keep_typing skips paused chats each tick and
-                # _stop_typing_refresh's finally discards it, so it cannot leak into the next
-                # turn. No new await on the delivery path (a fire-and-forget stop task was
-                # measured to have no effect).
-                if text_content or extracted.images or extracted.media_files or extracted.local_files \
-                        or _tts_paths or _tts_caption_delivered:
-                    self.pause_typing_for_chat(event.source.chat_id)
-                if text_content and not _tts_caption_delivered:
-                    await self._send_final_text(
-                        event, session_key, text_content, _final_thread_metadata,
-                        is_ephemeral_response, _ephemeral_ttl, _record_delivery)
-                await self._deliver_attachments(
-                    event, extracted, _final_thread_metadata,
-                    anything_sent=delivery_attempted or _tts_caption_delivered,
-                    record_delivery=_record_delivery)
+                            os.remove(_tts_requested_path)
+                    # A stalled ACK must not keep the typing refresh alive.
+                    if text_content or extracted.images or extracted.media_files or extracted.local_files \
+                            or _tts_paths or _tts_caption_delivered:
+                        self.pause_typing_for_chat(event.source.chat_id)
+                    if text_content and not _tts_caption_delivered:
+                        await self._send_final_text(
+                            event, session_key, text_content, _final_thread_metadata,
+                            is_ephemeral_response, _ephemeral_ttl, _record_delivery)
+                    await self._deliver_attachments(
+                        event, extracted, _final_thread_metadata,
+                        anything_sent=delivery_attempted or _tts_caption_delivered,
+                        record_delivery=_record_delivery)
             await self._release_turn_marker(event)
             processing_ok = delivery_succeeded if delivery_attempted else not bool(response)
             # Clean up the per-turn streaming-TTS flag.

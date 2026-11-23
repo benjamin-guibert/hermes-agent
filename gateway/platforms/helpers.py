@@ -1297,6 +1297,8 @@ async def send_reply_as_file(adapter: Any, chat_id: str, text: str, *, reply_to:
             raw = getattr(result, "raw_response", None)
             if not getattr(result, "success", False) or (isinstance(raw, dict) and raw.get("ambiguous")):
                 logger.warning("Long reply file %s was not confirmed delivered: %s", name, getattr(result, "error", None))
+                if isinstance(raw, dict) and raw.get("prevent_fallback"):
+                    _REPLY_FILE_FAILURE.set(result)
                 return None
             if getattr(result, "message_id", None):
                 ids.append(str(result.message_id))
@@ -1346,8 +1348,15 @@ async def try_reply_file(adapter: Any, chat_id: str, content: str, *, reply_to: 
 
 async def _file_result(adapter: Any, chat_id: str, content: str, reply_to: Optional[str],
                        metadata: Optional[dict]) -> Any:
-    ids = await send_reply_as_file(adapter, chat_id, content, reply_to=reply_to, metadata=metadata)
+    failure_scope = _REPLY_FILE_FAILURE.set(None)
+    try:
+        ids = await send_reply_as_file(adapter, chat_id, content, reply_to=reply_to, metadata=metadata)
+        blocked = _REPLY_FILE_FAILURE.get()
+    finally:
+        _REPLY_FILE_FAILURE.reset(failure_scope)
     if ids is None:
+        if blocked is not None:
+            return blocked
         logger.warning("Long reply could not be sent as a file; sending it as messages")
         return None
     from gateway.platforms.base import SendResult
@@ -1359,6 +1368,7 @@ async def _file_result(adapter: Any, chat_id: str, content: str, reply_to: Optio
 # (``adapter.send`` per preview, seal and tail) and counts them itself, so no piece is filed on its own;
 # and once a reply's upload failed, its message fallback must not try the upload again. A complete
 # message the consumer sends (commentary) opts back in with ``reply_file_off(False)``.
+_REPLY_FILE_FAILURE: contextvars.ContextVar[Any] = contextvars.ContextVar("hermes_reply_file_failure", default=None)
 _REPLY_FILE_OFF: contextvars.ContextVar[bool] = contextvars.ContextVar("hermes_reply_file_off", default=False)
 
 

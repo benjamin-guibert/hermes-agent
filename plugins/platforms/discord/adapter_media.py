@@ -6,12 +6,17 @@ import base64
 import contextlib
 import json
 import logging
+from functools import wraps
+
+from gateway.platforms.event import current_reply_trigger
+from gateway.outbound.operation import outbound_operation, outbound_delivery_scope
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from agent.i18n import t
 from gateway.platforms.base import SendResult
+from plugins.platforms.discord.archived_redirect import mark_redirect_delivered, redirect_archived_send
 
 logger = logging.getLogger("plugins.platforms.discord.adapter")
 
@@ -56,6 +61,76 @@ def _ogg_opus_duration(data: bytes) -> Optional[float]:
     return secs if secs > 0 else None
 
 
+def media_operation(method):
+    @wraps(method)
+    async def send(self, *args, **kwargs):
+        scope = current_reply_trigger.get()
+        in_final = isinstance(scope, tuple) and len(scope) == 4 and scope[1] is asyncio.current_task()
+        if outbound_operation.get() is not None or in_final:
+            return await method(self, *args, **kwargs)
+        with outbound_delivery_scope():
+            return await method(self, *args, **kwargs)
+    return send
+
+
+def media_delivery_result(channel, success, ids, error=None, *, ambiguous=False):
+    from plugins.platforms.discord.adapter import discord
+    raw = {"message_ids": list(ids), "ambiguous": ambiguous, "prevent_fallback": ambiguous}
+    if channel is not None:
+        raw.update(chat_id=str(channel.id), thread_id=str(channel.id) if isinstance(channel, discord.Thread) else None)
+    if not success and ids:
+        raw["partial_overflow"] = True
+    return SendResult(success=success, message_id=(ids[-1] if success else ids[0]) if ids else None, error=error, raw_response=raw)
+
+
+async def fallback_image_chunk(adapter, channel, chunk, metadata):
+    from urllib.request import url2pathname
+    ids = []
+    for image_url, alt_text in chunk:
+        if image_url.startswith("file://"):
+            result = await adapter.send_image_file(channel.id, url2pathname(image_url[7:]), alt_text, metadata=metadata)
+        elif adapter._is_animation_url(image_url):
+            result = await adapter.send_animation(channel.id, image_url, alt_text, metadata=metadata)
+        else:
+            result = await adapter.send_image(channel.id, image_url, alt_text, metadata=metadata)
+        raw = result.raw_response or {}
+        ids.extend(raw.get("message_ids") or ([result.message_id] if result.message_id else []))
+        if not result.success:
+            return media_delivery_result(channel, False, ids, result.error, ambiguous=bool(raw.get("ambiguous")))
+    return media_delivery_result(channel, True, ids)
+
+
+async def resolve_image_route(adapter, chat_id, metadata):
+    from plugins.platforms.discord.adapter import _prompt_target_id
+    try:
+        channel = await adapter._resolve_channel(_prompt_target_id(chat_id, metadata))
+        if channel is None:
+            raise ValueError("Discord image channel not found")
+        channel, prefix, redirected = await redirect_archived_send(
+            adapter, channel, "", (metadata or {}).get("reply_to_message_id"), metadata)
+        return channel, prefix, redirected, None
+    except Exception as exc:
+        logger.debug("Discord image route failed", exc_info=True)
+        return None, "", False, SendResult(success=False, error=str(exc))
+
+
+async def image_batch_failure(adapter, channel, chunk, metadata, confirmed_ids, error):
+    if confirmed_ids or getattr(error, "status", None) not in (400, 403, 404, 413, 415, 422):
+        return media_delivery_result(channel, False, confirmed_ids, str(error) or type(error).__name__,
+                                     ambiguous=getattr(error, "status", None) is None)
+    logger.debug("Discord image batch rejected; retrying individual images", exc_info=True)
+    return await fallback_image_chunk(adapter, channel, chunk, metadata)
+
+
+def image_batch_caption(adapter, captions, notices, prefix):
+    content = captions[0] if captions else None
+    if prefix:
+        content = prefix + (content or "")
+    if notices:
+        content = adapter.warning_text("\n".join(([content] if content else []) + notices), content)
+    return content
+
+
 class DiscordMediaMixin:
     REPLY_FILE_MAX_BYTES = _DISCORD_REPLY_FILE_MAX_BYTES
 
@@ -74,8 +149,11 @@ class DiscordMediaMixin:
         result = await self._send_local_file(chat_id, file_path, caption, file_name=file_name,
                                              not_found="File not found", kind="reply file", metadata=metadata)
         if not result.success and result.message_id:  # accepted without the attachment (#66797)
-            await self.delete_message(chat_id, str(result.message_id))
-            result.message_id = None
+            actual_chat = (result.raw_response or {}).get("chat_id", chat_id)
+            if await self.delete_message(actual_chat, str(result.message_id)):
+                result.raw_response = {**(result.raw_response or {}),
+                                       "deleted_message_ids": [str(result.message_id)], "message_ids": []}
+                result.message_id = None
         return result
 
     async def delete_message(self, chat_id: str, message_id: str) -> bool:
@@ -147,6 +225,7 @@ class DiscordMediaMixin:
             logger.debug("[%s] Failed to send oversized-file notice for %s", self.name, filename, exc_info=True)
         return SendResult(success=False, error=error)
 
+    @media_operation
     async def _send_file_attachment(
         self, chat_id: str, file_path: str, caption: Optional[str] = None,
         file_name: Optional[str] = None, metadata: Optional[dict[str, Any]] = None,
@@ -166,6 +245,8 @@ class DiscordMediaMixin:
         channel = await self._resolve_channel(_prompt_target_id(chat_id, metadata))
         if not channel:
             return SendResult(success=False, error=f"Channel {chat_id} not found")
+        channel, caption, redirected = await redirect_archived_send(
+            self, channel, caption or "", (metadata or {}).get("reply_to_message_id"), metadata)
         filename = file_name or os.path.basename(file_path)
         rejected = await self._reject_oversized_upload(channel, file_path, filename, caption=caption)
         if rejected is not None:
@@ -181,7 +262,12 @@ class DiscordMediaMixin:
                 channel, content=(caption or "").strip(), files=[discord_file],
             )
             return result
-        msg = await channel.send(content=caption if caption else None, files=[discord_file])
+        try:
+            msg = await channel.send(content=caption if caption else None, files=[discord_file])
+        except Exception as exc:
+            logger.debug("Discord attachment POST failed", exc_info=True)
+            return media_delivery_result(channel, False, [], str(exc) or type(exc).__name__,
+                                         ambiguous=getattr(exc, "status", None) is None)
         attachments = getattr(msg, "attachments", None) or []
         if not attachments:
             # Discord accepted the message but attached nothing: fail loud instead of a silent drop.
@@ -195,10 +281,15 @@ class DiscordMediaMixin:
                 success=False,
                 error=f"Discord accepted the message but attached no files ({filename})",
                 message_id=str(getattr(msg, "id", "") or "") or None,
+                raw_response={"chat_id": str(channel.id), "thread_id": str(channel.id) if isinstance(channel, discord.Thread) else None, "message_ids": [str(msg.id)]},
             )
-        return SendResult(success=True, message_id=str(msg.id))
+        if redirected:
+            mark_redirect_delivered()
+        return SendResult(success=True, message_id=str(msg.id), raw_response={
+            "chat_id": str(channel.id), "thread_id": str(channel.id) if isinstance(channel, discord.Thread) else None, "message_ids": [str(msg.id)]})
 
 
+    @media_operation
     async def send_multiple_images(
         self, chat_id: str, images: list[tuple[str, str]],
         metadata: Optional[dict[str, Any]] = None, human_delay: float = 0.0,
@@ -217,17 +308,13 @@ class DiscordMediaMixin:
             from urllib.parse import unquote as _unquote
         except Exception:  # pragma: no cover
             return await super().send_multiple_images(chat_id, images, metadata, human_delay)
-        try:
-            channel = await self._resolve_channel(_prompt_target_id(chat_id, metadata))
-            if not channel:
-                logger.warning("[%s] Channel %s not found for multi-image send", self.name, chat_id)
-                return SendResult(success=False, error=f"Channel {chat_id} not found")
-        except Exception as e:
-            logger.warning("[%s] Failed to resolve channel for multi-image send: %s", self.name, e)
-            return await super().send_multiple_images(chat_id, images, metadata, human_delay)
+        channel, redirect_prefix, redirected, route_error = await resolve_image_route(self, chat_id, metadata)
+        if route_error is not None:
+            return route_error
         CHUNK = 10
         chunks = [images[i:i + CHUNK] for i in range(0, len(images), CHUNK)]
         delivered = False
+        message_ids = []
         for chunk_idx, chunk in enumerate(chunks):
             if human_delay > 0 and chunk_idx > 0:
                 await asyncio.sleep(human_delay)
@@ -315,9 +402,7 @@ class DiscordMediaMixin:
                             )
                     continue
                 # Use the first caption if any (Discord only has one message body for the group)
-                content = captions[0] if captions else None
-                if skip_notices:
-                    content = self.warning_text("\n".join(([content] if content else []) + skip_notices), content)
+                content = image_batch_caption(self, captions, skip_notices, redirect_prefix)
                 logger.info(
                     "[%s] Sending %d image(s) as single Discord message (chunk %d/%d)",
                     self.name, len(files), chunk_idx + 1, len(chunks),
@@ -327,83 +412,89 @@ class DiscordMediaMixin:
                         channel, content=(content or "").strip(), files=files,
                     )
                 else:
-                    await channel.send(content=content, files=files)
+                    message = await channel.send(content=content, files=files)
+                    message_ids.append(str(message.id))
                 delivered = True
+                if redirected:
+                    mark_redirect_delivered()
+                    redirect_prefix = ""
             except Exception as e:
-                logger.warning(
-                    "[%s] Multi-image Discord send failed (chunk %d/%d), falling back to per-image: %s",
-                    self.name, chunk_idx + 1, len(chunks), e, exc_info=True,
-                )
-                fallback = await super().send_multiple_images(chat_id, chunk, metadata, human_delay=human_delay)
-                delivered = delivered or fallback.success
+                fallback = await image_batch_failure(self, channel, chunk, metadata, message_ids, e)
+                if not fallback.success:
+                    return fallback
+                message_ids.extend((fallback.raw_response or {}).get("message_ids", []))
+                delivered = True
             finally:
                 if aiohttp_session is not None:
                     try:
                         await aiohttp_session.close()
                     except Exception:
                         pass
-        return SendResult(success=delivered, error=None if delivered else "all images failed to send")
+        return media_delivery_result(channel, delivered, message_ids, None if delivered else "all images failed to send")
 
 
+    @media_operation
     async def send_voice(
         self, chat_id: str, audio_path: str, caption: Optional[str] = None,
         reply_to: Optional[str] = None, metadata: Optional[dict[str, Any]] = None,
         is_voice: Optional[bool] = None, **kwargs,
     ) -> SendResult:
-        """Deliver audio. ``is_voice=False`` is the media dispatch's plain audio attachment (sound
-        effect, music, an mp3 without ``[[audio_as_voice]]``): it goes out as a regular file under
-        its real name, which Discord renders with an inline player. Voice intent (``True`` from
-        ``[[audio_as_voice]]``, or no flag: auto-TTS and voice replies) becomes a native voice
-        message, which Discord only plays as Ogg/Opus."""
+        """Keep native voice mode; only a definitive native rejection permits a file fallback."""
         if is_voice is False:
-            return await self._send_local_file(
-                chat_id, audio_path, caption, not_found="Audio file not found", kind="audio",
-                metadata=metadata,
-            )
+            return await self._send_local_file(chat_id, audio_path, caption,
+                not_found="Audio file not found", kind="audio", metadata=metadata)
         from plugins.platforms.discord.adapter import _prompt_target_id, discord
-
+        if not await asyncio.to_thread(os.path.isfile, audio_path):
+            return SendResult(success=False, error=f"Audio file not found: {audio_path}")
+        channel = None
+        ids = []
         try:
             import io
             channel = await self._resolve_channel(_prompt_target_id(chat_id, metadata))
             if not channel:
                 return SendResult(success=False, error=f"Channel {chat_id} not found")
-            if not os.path.exists(audio_path):
-                return SendResult(success=False, error=f"Audio file not found: {audio_path}")
-            filename = os.path.basename(audio_path)
-            rejected = await self._reject_oversized_upload(channel, audio_path, filename, caption=caption)
-            if rejected is not None:
-                return rejected
-            reference = self._reply_reference_for_send(reply_to, channel)
-            # Forum channels reject POST /messages (native voice path too); create a thread post instead.
-            if self._is_forum_parent(channel):
-                file_data = await asyncio.to_thread(Path(audio_path).read_bytes)
-                forum_file = discord.File(io.BytesIO(file_data), filename=filename)
-                return await self._forum_post_file(
-                    channel, content=(caption or "").strip(), file=forum_file,
-                )
+            if await asyncio.to_thread(os.path.getsize, audio_path) > self._discord_upload_limit_bytes(channel):
+                channel, _, invalid_redirect = await redirect_archived_send(
+                    self, channel, "", reply_to or (metadata or {}).get("reply_to_message_id"), metadata)
+                if not invalid_redirect:
+                    return await self._reject_oversized_upload(channel, audio_path, os.path.basename(audio_path), caption=caption)
+                return media_delivery_result(channel, False, [], "Audio file too large for Discord upload")
             voice = await self._ogg_opus_voice_payload(audio_path)
+            channel, routed_caption, redirected = await redirect_archived_send(
+                self, channel, caption or "", reply_to or (metadata or {}).get("reply_to_message_id"), metadata)
+            if redirected:
+                reply_to = None
+                if routed_caption:
+                    prefix = await channel.send(content=routed_caption)
+                    ids.append(str(prefix.id))
+                    mark_redirect_delivered()
+            reference = self._reply_reference_for_send(reply_to, channel)
+            if self._is_forum_parent(channel):
+                forum_file = discord.File(io.BytesIO(await asyncio.to_thread(Path(audio_path).read_bytes)), filename=os.path.basename(audio_path))
+                return await self._forum_post_file(channel, content=(caption or "").strip(), file=forum_file)
             if voice is not None:
                 try:
-                    return await self._post_voice_message(channel, *voice, reply_to=reply_to, reference=reference)
-                except Exception as voice_err:
-                    logger.debug("Voice message flag failed, falling back to file: %s", voice_err)
-            else:
-                logger.warning(
-                    "[%s] %s is not Ogg/Opus and could not be transcoded (install ffmpeg for voice "
-                    "messages); sending it as an audio attachment", self.name, filename)
+                    result = await self._post_voice_message(channel, *voice, reply_to=reply_to, reference=reference)
+                    raw = result.raw_response or {}
+                    result.raw_response = {**raw, "message_ids": [*ids, *(raw.get("message_ids") or [])]}
+                    return result
+                except Exception as exc:
+                    logger.debug("Discord native voice POST failed", exc_info=True)
+                    if getattr(exc, "status", None) not in (400, 403, 404, 413, 415, 422):
+                        return media_delivery_result(channel, False, ids, str(exc) or type(exc).__name__, ambiguous=True)
             file_data = await asyncio.to_thread(Path(audio_path).read_bytes)
-            file = discord.File(io.BytesIO(file_data), filename=filename)
+            file = discord.File(io.BytesIO(file_data), filename=os.path.basename(audio_path))
             try:
-                msg = await channel.send(file=file, reference=reference)
-            except Exception as send_err:
-                if reference is not None and self._is_reply_reference_rejected(send_err):
-                    msg = await channel.send(file=file, reference=None)
-                else:
+                message = await channel.send(file=file, reference=reference)
+            except Exception as exc:
+                if reference is None or not self._is_reply_reference_rejected(exc):
                     raise
-            return SendResult(success=True, message_id=str(msg.id))
-        except Exception as e:  # pragma: no cover - defensive logging
-            logger.error("[%s] Failed to send audio: %s", self.name, e, exc_info=True)
-            return SendResult(success=False, error=str(e))
+                message = await channel.send(file=file, reference=None)
+            ids.append(str(message.id))
+            return media_delivery_result(channel, True, ids)
+        except Exception as exc:
+            logger.debug("Discord voice delivery failed", exc_info=True)
+            return media_delivery_result(channel, False, ids, str(exc) or type(exc).__name__, ambiguous=bool(channel))
 
     @staticmethod
     async def _ogg_opus_voice_payload(audio_path: str) -> Optional[tuple[bytes, float]]:
@@ -449,7 +540,8 @@ class DiscordMediaMixin:
             discord.http.Route("POST", "/channels/{channel_id}/messages", channel_id=channel.id),
             form=form,
         )
-        return SendResult(success=True, message_id=str(msg_data["id"]))
+        return SendResult(success=True, message_id=str(msg_data["id"]), raw_response={
+            "chat_id": str(channel.id), "thread_id": str(channel.id) if isinstance(channel, discord.Thread) else None, "message_ids": [str(msg_data["id"])]})
 
 
     async def _send_local_file(self, chat_id, path, caption, *, file_name=None, not_found: str, kind: str, metadata=None):
@@ -474,6 +566,7 @@ class DiscordMediaMixin:
         )
 
 
+    @media_operation
     async def _send_url_media(
         self, chat_id: str, url: str, caption: Optional[str], *, kind: str,
         filename_for, fallback, metadata: Optional[dict], error_metadata: Optional[dict],
@@ -487,11 +580,15 @@ class DiscordMediaMixin:
         if not is_safe_url(url):
             logger.warning("[%s] Blocked unsafe %s URL during Discord send_%s", self.name, kind, kind)
             return await fallback(metadata)
+        post_started = False
+        channel = None
         try:
             import aiohttp
             channel = await self._resolve_channel(_prompt_target_id(chat_id, metadata))
             if not channel:
                 return SendResult(success=False, error=f"Channel {chat_id} not found")
+            channel, caption, redirected = await redirect_archived_send(
+                self, channel, caption or "", (metadata or {}).get("reply_to_message_id"), metadata)
             from gateway.platforms.base import resolve_proxy_url, proxy_kwargs_for_aiohttp
             _sess_kw, _req_kw = proxy_kwargs_for_aiohttp(resolve_proxy_url(platform_env_var="DISCORD_PROXY"))
             async with aiohttp.ClientSession(**_sess_kw) as session:
@@ -504,12 +601,17 @@ class DiscordMediaMixin:
                 file = discord.File(io.BytesIO(data), filename=filename_for(headers))
                 if self._is_forum_parent(channel):
                     return await self._forum_post_file(channel, content=(caption or "").strip(), file=file)
+                post_started = True
                 msg = await channel.send(content=caption if caption else None, file=file)
-                return SendResult(success=True, message_id=str(msg.id))
+                if redirected:
+                    mark_redirect_delivered()
+                return SendResult(success=True, message_id=str(msg.id), raw_response={"chat_id": str(channel.id), "thread_id": str(channel.id) if isinstance(channel, discord.Thread) else None, "message_ids": [str(msg.id)]})
         except ImportError:
             logger.warning("[%s] aiohttp not installed, falling back to URL. Run: pip install aiohttp", self.name, exc_info=True)
             return await fallback(error_metadata)
         except Exception as e:  # pragma: no cover - defensive logging
+            if post_started and getattr(e, "status", None) not in (400, 403, 404, 413, 415, 422):
+                return media_delivery_result(channel, False, [], str(e) or type(e).__name__, ambiguous=True)
             logger.error("[%s] Failed to send %s attachment, falling back to URL: %s", self.name, kind, e, exc_info=True)
             return await fallback(error_metadata)
 

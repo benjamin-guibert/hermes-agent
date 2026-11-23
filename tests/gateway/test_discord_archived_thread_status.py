@@ -114,8 +114,14 @@ async def test_send_goes_out_unless_status_to_known_archived_thread(make_adapter
     with caplog.at_level(logging.INFO):
         result = await adapter.send(PARENT_ID, "hello", metadata=metadata)
 
-    channel.send.assert_awaited_once()
-    assert result.success is True and result.message_id == "9001"
+    requires_guard = isinstance(channel, FakeThread) and getattr(channel, "archived", None) is not False
+    if requires_guard:
+        channel.send.assert_not_awaited()
+        assert result.success is False
+        assert "delivery refused" in result.error
+    else:
+        channel.send.assert_awaited_once()
+        assert result.success is True and result.message_id == "9001"
     assert not _skip_lines(caplog)
 
 

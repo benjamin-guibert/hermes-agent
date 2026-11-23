@@ -8,6 +8,7 @@ import os
 import re
 
 from agent.secret_scope import get_secret
+from gateway.outbound.operation import outbound_delivery_scope
 
 # Pinned name: these lines stay under `hermes logs --component tools`.
 logger = logging.getLogger("tools.send_message_tool")
@@ -568,7 +569,9 @@ async def _send_chunks(chunks, send_one):
             if outcome.has_landed:
                 result = outcome.failure(result)
             break
-        outcome.landed(result.get("message_id") if isinstance(result, dict) else None)
+        ids = result.get("message_ids") if isinstance(result, dict) else None
+        for message_id in ids or [result.get("message_id") if isinstance(result, dict) else None]:
+            outcome.landed(message_id)
     if isinstance(result, dict) and not result.get("error"):
         result = {**result, **outcome.split_fields()}
     return result
@@ -672,6 +675,13 @@ _MEDIA_PLATFORMS_NOTE = "telegram, discord, matrix, weixin, signal, feishu, what
 
 
 async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None,
+                            force_document=False, mentions=None, args=None, notify=None):
+    with outbound_delivery_scope():
+        return await _send_to_platform_impl(platform, pconfig, chat_id, message, thread_id, media_files,
+                                           force_document, mentions, args, notify)
+
+
+async def _send_to_platform_impl(platform, pconfig, chat_id, message, thread_id=None, media_files=None,
                             force_document=False, mentions=None, args=None, notify=None):
     """Route to the platform sender, chunking long text with the adapters' splitter. Order matters:
     Weixin first (its native helper must not be blocked by unrelated optional imports such as

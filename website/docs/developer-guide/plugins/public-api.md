@@ -45,6 +45,10 @@ with a name allows that one name only.
 | `agent.web_search_provider` | whole module | developer-guide / plugins docs |
 | `cli` | whole module | developer-guide / plugins docs |
 | `gateway.config` | whole module | developer-guide / plugins docs |
+| `gateway.delivery_ledger` | `checkpoint_delivery_progress` | developer-guide / plugins docs |
+| `gateway.delivery_ledger` | `current_delivery_obligation` | developer-guide / plugins docs |
+| `gateway.outbound.operation` | `outbound_delivery_scope` | developer-guide / plugins docs |
+| `gateway.outbound.operation` | `outbound_operation` | developer-guide / plugins docs |
 | `gateway.platform_registry` | whole module | developer-guide / plugins docs |
 | `gateway.platforms._shared` | whole module | developer-guide / plugins docs |
 | `gateway.platforms.base` | whole module | developer-guide / plugins docs |

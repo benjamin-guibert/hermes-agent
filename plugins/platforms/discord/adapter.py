@@ -1155,6 +1155,7 @@ class VoiceReceiver:
         )
 
 
+from plugins.platforms.discord.archived_redirect import capture_live_trigger, redirect_archived_send, PROGRESS_CONTRACT, make_redirect_progress, send_guarded_chunks, failed_guarded_chunks
 from plugins.platforms.discord.adapter_archived_status import archived_status_extra, skip_status_in_archived_thread
 from plugins.platforms.discord.adapter_config_readers import (
     _DISCORD_PROMPT_TIMEOUT_DEFAULT, _DISCORD_PROMPT_TIMEOUT_MIN, _read_discord_prompt_timeout, _read_dm_role_auth_guild,
@@ -1171,7 +1172,7 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 
 from plugins.platforms.discord.adapter_media import DiscordMediaMixin
-from plugins.platforms.discord.standalone_rest import api_url as _rest_url, post_paced as _post_paced
+from plugins.platforms.discord.standalone_rest import api_url as _rest_url, resolve_rest_route, post_rest_text, post_rest_file, post_missing_caption
 from plugins.platforms.discord.adapter_opus import load_opus_codec
 from plugins.platforms.discord.adapter_authorization import DiscordAuthorizationMixin, is_automated_message
 from plugins.platforms.discord.adapter_recovery import recovery_extra
@@ -3024,6 +3025,9 @@ class DiscordAdapter(DiscordLiveGatesMixin, DiscordCommandSyncMixin, DiscordAuth
             result = SendResult(success=False, error="Refusing to send empty message")
             # Backfill replays from this table: record the dropped final reply as failed or it is lost.
             return await self._record_response_async(reply_to, result, content, bool(metadata and metadata.get("notify")), metadata)
+        message_ids = []
+        chunks = []
+        progress = None
         try:
             thread_id = (metadata or {}).get("thread_id") or None
             nonconversational = _metadata_marks_nonconversational(metadata)
@@ -3038,6 +3042,13 @@ class DiscordAdapter(DiscordLiveGatesMixin, DiscordCommandSyncMixin, DiscordAuth
                     return SendResult(success=False, error=f"Channel {chat_id} not found")
             if (skipped := skip_status_in_archived_thread(self.config.extra, channel, nonconversational)) is not None:
                 return skipped
+            original_target = str(channel.id)
+            channel, content, redirected = await redirect_archived_send(self, channel, content, reply_to, metadata)
+            if redirected:
+                metadata = {**(metadata or {}), "reply_to_message_id": reply_to or (metadata or {}).get("reply_to_message_id")}
+                reply_to = None
+                thread_id = None
+                chat_id = str(channel.id)
             # Forum channels reject channel.send() — create a thread post instead.
             if self._is_forum_parent(channel):
                 result = await self._send_to_forum(channel, content)
@@ -3045,25 +3056,8 @@ class DiscordAdapter(DiscordLiveGatesMixin, DiscordCommandSyncMixin, DiscordAuth
             formatted = self.format_message(content)
             chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
             message_ids = []
-            reference = self._reply_reference_for_send(reply_to, channel)
-            for i, chunk in enumerate(chunks):
-                if self._reply_to_mode == "all":
-                    chunk_reference = reference
-                else:  # "first" (default) or "off"
-                    chunk_reference = reference if i == 0 else None
-                try:
-                    msg = await channel.send(content=chunk, reference=chunk_reference)
-                except Exception as e:
-                    if chunk_reference is not None and self._is_reply_reference_rejected(e):
-                        logger.warning(
-                            "[%s] Reply target %s rejected the reply reference; retrying send without reply reference",
-                            self.name, reply_to,
-                        )
-                        reference = None
-                        msg = await channel.send(content=chunk, reference=None)
-                    else:
-                        raise
-                message_ids.append(str(msg.id))
+            progress = make_redirect_progress(channel, original_target, chunks, redirected, metadata)
+            await send_guarded_chunks(self, channel, chunks, message_ids, reply_to, redirected, progress, metadata)
             # Track the last sent message for history backfill (skips the full history scan).
             if message_ids:
                 _target_id = thread_id or chat_id
@@ -3077,7 +3071,7 @@ class DiscordAdapter(DiscordLiveGatesMixin, DiscordCommandSyncMixin, DiscordAuth
             result = SendResult(
                 success=True,
                 message_id=message_ids[0] if message_ids else None,
-                raw_response={"message_ids": message_ids}
+                raw_response=progress or {"message_ids": message_ids, "chat_id": str(channel.id), "thread_id": thread_id}
             )
             return await self._record_response_async(reply_to, result, content, final_delivery, metadata)
         except Exception as e:  # pragma: no cover - defensive logging
@@ -3087,7 +3081,62 @@ class DiscordAdapter(DiscordLiveGatesMixin, DiscordCommandSyncMixin, DiscordAuth
                 result = SendResult(success=False, error="send_path_degraded", retryable=True)
             else:
                 result = SendResult(success=False, error=str(e))
+            result = await failed_guarded_chunks(result, progress, e, message_ids, chunks, chat_id, thread_id)
             return await self._record_response_async(reply_to, result, content, bool(metadata and metadata.get("notify")), metadata)
+
+    def _send_retry_is_final(self, result):
+        raw = result.raw_response or {}
+        return bool(raw.get("progress_storage_failed")) or (
+            raw.get("progress_contract") == PROGRESS_CONTRACT and raw.get("resume_safe") is False)
+
+    async def resume_delivery_receipt(self, receipt):
+        """Recover only a validated, confirmed-unsent suffix. No inbound permission survives."""
+        try:
+            raw = json.loads(receipt)
+        except (TypeError, ValueError):
+            return SendResult(success=False, error="Invalid delivery progress; delivery refused")
+        if (not isinstance(raw, dict) or raw.get("progress_contract") != PROGRESS_CONTRACT
+                or not isinstance(raw.get("origin_thread_id"), str) or not raw["origin_thread_id"].isdigit()
+                or raw.get("resume_safe") is not True
+                or raw.get("thread_id") is not None
+                or not isinstance(raw.get("chat_id"), str) or not raw["chat_id"].isdigit()
+                or not isinstance(raw.get("message_ids"), list)
+                or not all(isinstance(value, str) and value.isdigit() for value in raw["message_ids"])
+                or not isinstance(raw.get("remaining_chunks"), list)
+                or not (raw["message_ids"] or raw["remaining_chunks"])
+                or not all(isinstance(value, str) and bool(value) for value in raw["remaining_chunks"])):
+            return SendResult(success=False, error="Unknown delivery progress; automatic replay refused")
+        if not raw["remaining_chunks"]:
+            return SendResult(success=True, message_id=raw["message_ids"][0] if raw["message_ids"] else None, raw_response=raw)
+        prior = SendResult(success=False, raw_response=raw)
+        return await self._resume_partial_send(raw["chat_id"], prior)
+
+    async def _resume_partial_send(self, chat_id, result, *, reply_to=None, metadata=None):
+        raw = result.raw_response or {}
+        if not raw.get("resume_safe") or not raw.get("remaining_chunks"):
+            return None
+        remaining = list(raw["remaining_chunks"])
+        delivered_ids = list(raw.get("message_ids", []))
+        actual_chat = str(raw["chat_id"])
+        actual_metadata = {**(metadata or {}), "thread_id": raw.get("thread_id")}
+        for index, chunk in enumerate(remaining):
+            if raw.get("progress_contract") == PROGRESS_CONTRACT:
+                actual_metadata["_redirect_progress"] = {**raw, "message_ids": list(delivered_ids), "later_chunks": remaining[index + 1:]}
+            resumed = await self.send(actual_chat, chunk, metadata=actual_metadata)
+            latest = resumed.raw_response or {}
+            if latest.get("progress_contract") == PROGRESS_CONTRACT:
+                delivered_ids = list(latest.get("message_ids", []))
+            else:
+                delivered_ids.extend(latest.get("message_ids", []))
+            if not resumed.success:
+                resumed.raw_response = {**raw, **latest, "message_ids": delivered_ids,
+                                        "remaining_chunks": latest.get("remaining_chunks", remaining[index:]),
+                                        "partial_overflow": bool(delivered_ids),
+                                        "resume_safe": latest.get("resume_safe") is True}
+                return resumed
+        resumed.raw_response = {**(resumed.raw_response or {}), "message_ids": delivered_ids}
+        resumed.message_id = delivered_ids[0] if delivered_ids else None
+        return resumed
 
     @staticmethod
     def _forum_thread_parts(thread: Any) -> tuple:
@@ -6036,6 +6085,7 @@ class DiscordAdapter(DiscordLiveGatesMixin, DiscordCommandSyncMixin, DiscordAuth
                 reply_to_text = getattr(message.reference.resolved, "content", None) or None
         event = MessageEvent(
             text=event_text, message_type=msg_type, source=source, raw_message=message,
+            reply_trigger=capture_live_trigger(self, message, recovered=recovered),
             message_id=str(message.id), media_urls=media_urls, media_types=media_types,
             media_text_inlined=media_text_inlined,
             reply_to_message_id=reply_to_id, reply_to_text=reply_to_text,
@@ -6760,7 +6810,7 @@ async def _standalone_is_forum(aiohttp, chat_id: str, json_headers: dict, sess_k
 
 async def _standalone_send(
     pconfig, chat_id: str, message: str, *, thread_id: Optional[str] = None,
-    media_files: Optional[list] = None, force_document: bool = False, caption: Optional[str] = None,
+    media_files: Optional[list] = None, force_document: bool = False, caption: Optional[str] = None, mentions=None,
 ) -> dict[str, Any]:
     """Send via Discord REST without a live gateway adapter (token: ``pconfig.token`` then env var). Forum
     channels (type 15) reject ``POST /messages``: a thread post is created via ``POST /channels/{id}/threads``
@@ -6778,12 +6828,21 @@ async def _standalone_send(
         return send_error("Discord standalone send: DISCORD_BOT_TOKEN is not set", nothing_sent=True)
     from gateway.platforms.base import describe_proxy_error, resolve_proxy_url, proxy_kwargs_for_aiohttp
     _proxy, last_data = resolve_proxy_url(platform_env_var="DISCORD_PROXY"), None
+    message_ids = []
     try:
         _sess_kw, _req_kw = proxy_kwargs_for_aiohttp(_proxy)
         auth_headers = {"Authorization": f"Bot {token}"}
         json_headers = {**auth_headers, "Content-Type": "application/json"}
         media_files = media_files or []
         warnings = []
+        try:
+            route = await resolve_rest_route(aiohttp, pconfig, chat_id, thread_id, message, caption, mentions,
+                json_headers, _sess_kw, _req_kw, _standalone_read_json_limited,
+                _DISCORD_STANDALONE_JSON_BODY_LIMIT_BYTES, _remember_channel_is_forum)
+        except ValueError as exc:
+            return send_error(str(exc), nothing_sent=True)
+        chat_id, thread_id, message, caption = route.chat_id, route.thread_id, route.message, route.caption
+        redirected, route_cache, mentions = route.redirected, route.cache, route.mentions
         if thread_id:
             url = _rest_url(f"channels/{thread_id}/messages")
         else:
@@ -6841,11 +6900,16 @@ async def _standalone_send(
                 return result
             url = _rest_url(f"channels/{chat_id}/messages")
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30), **_sess_kw) as session:
+            message_ids = []
             if message.strip() or not media_files:
-                last_data, err = await _post_paced(session, url, _standalone_response_json_or_error, "Discord API error",
-                                                   headers=json_headers, json={"content": message}, **_req_kw)
-                if err:  # paced: a 429 waits retry_after and retries, so a long split never floods (#152012)
-                    return err
+                last_data, err = await post_rest_text(session, url,
+                    BasePlatformAdapter.truncate_message(message, DiscordAdapter.MAX_MESSAGE_LENGTH),
+                    _standalone_response_json_or_error, json_headers, _req_kw, mentions,
+                    route_cache if redirected else None, message_ids)
+                if err:
+                    return {**err, "chat_id": chat_id, "thread_id": thread_id,
+                            **({"delivery": "partial", "partial_success": True, "delivered_message_ids": message_ids,
+                                "retryable": False} if message_ids else {})}
             # One multipart upload per file; a MEDIA:<path> caption rides as the attachment message's
             # content, and caption_pending makes a missing file fall back to a plain message.
             caption_pending = bool(caption)
@@ -6853,37 +6917,26 @@ async def _standalone_send(
                 if not os.path.exists(media_path):
                     warnings.append(_standalone_warn_missing_media(media_path))
                     if caption_pending:
-                        try:
-                            async with session.post(
-                                url, headers=json_headers, json={"content": caption}, **_req_kw,
-                            ) as resp:
-                                if resp.status in {200, 201}:
-                                    last_data = await _standalone_read_json_limited(
-                                        resp, _DISCORD_STANDALONE_JSON_BODY_LIMIT_BYTES,
-                                    )
-                                    caption_pending = False
-                        except Exception:
-                            logger.warning("Discord caption-fallback send failed for missing media")
+                        fallback = await post_missing_caption(session, url, caption, json_headers, _req_kw,
+                            _standalone_read_json_limited, _DISCORD_STANDALONE_JSON_BODY_LIMIT_BYTES,
+                            message_ids, route_cache if redirected else None)
+                        if fallback is not None:
+                            last_data, caption_pending = fallback, False
                     continue
                 try:
-                    form = aiohttp.FormData()
-                    filename = os.path.basename(media_path)
-                    if caption_pending:
-                        form.add_field(
-                            "payload_json", json.dumps({"content": caption}),
-                            content_type="application/json",
-                        )
-                        caption_pending = False
-                    with open(media_path, "rb") as f:  # noqa: ASYNC230 -- file handle is streamed to the upload; a local open() is non-blocking in practice
-                        form.add_field("files[0]", f, filename=filename)
-                        async with session.post(url, headers=auth_headers, data=form, **_req_kw) as resp:
-                            data, err = await _standalone_response_json_or_error(resp, "Discord API error")
-                            if err:
-                                warning = send_error(f"Failed to send media {media_path}: {err['error']}")["error"]
-                                logger.error(warning)
-                                warnings.append(warning)
-                                continue
-                            last_data = data
+                    data, err = await post_rest_file(aiohttp, session, url, media_path,
+                        caption if caption_pending else None, mentions, auth_headers, _req_kw,
+                        _standalone_response_json_or_error)
+                    caption_pending = False
+                    if err:
+                        warning = send_error(f"Failed to send media {media_path}: {err['error']}")["error"]
+                        logger.error(warning)
+                        warnings.append(warning)
+                        continue
+                    last_data = data
+                    message_ids.append(str(last_data.get("id")))
+                    if redirected:
+                        route_cache["prefix_sent"] = True
                 except Exception as e:
                     warning = send_error(f"Failed to send media {media_path}: {describe_proxy_error(e, _proxy) or e}")["error"]
                     logger.error(warning)
@@ -6891,7 +6944,8 @@ async def _standalone_send(
         if last_data is None:
             error = "No deliverable text or media remained after processing"
             return {**send_error(error), **({"warnings": warnings} if warnings else {})}
-        result = {"success": True, "platform": "discord", "chat_id": chat_id, "message_id": last_data.get("id")}
+        result = {"success": True, "platform": "discord", "chat_id": chat_id, "message_id": last_data.get("id"),
+                  "thread_id": thread_id, "message_ids": message_ids}
         if warnings:
             result["warnings"] = warnings
         return result
@@ -6899,7 +6953,11 @@ async def _standalone_send(
         # Include the exception type: str(TimeoutError()) is empty. The text may echo the proxy URL.
         shown = describe_proxy_error(e, _proxy)
         logger.error("Discord standalone send failed%s", f": {shown}" if shown else "", exc_info=not shown)
-        return send_error(f"Discord send failed: {shown or f'{type(e).__name__}: {e}'}", nothing_sent=last_data is None and request_never_left(e))
+        error = send_error(f"Discord send failed: {shown or f'{type(e).__name__}: {e}'}",
+                           nothing_sent=last_data is None and request_never_left(e))
+        return {**error, "chat_id": thread_id or chat_id, "thread_id": thread_id,
+                **({"delivery": "partial", "partial_success": True, "message_ids": message_ids,
+                    "delivered_message_ids": message_ids, "retryable": False} if message_ids else {})}
 
 
 # ── Plugin entry point ────────────────────────────────────────────────────────
@@ -7014,6 +7072,8 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
             seeded_extra[primary_key] = value
             if env_key:
                 _env_default(env_key, str(value))
+    if "redirect_archived_thread_messages" in discord_cfg:
+        seeded_extra["redirect_archived_thread_messages"] = discord_cfg["redirect_archived_thread_messages"]
     seeded_extra.update(archived_status_extra(discord_cfg))
     return seeded_extra or None
 
