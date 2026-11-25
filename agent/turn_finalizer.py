@@ -288,13 +288,14 @@ def _close_transcript_tail(agent, messages, final_response, interrupted, _recove
 def _store_rewrite_on_tail(agent, messages, raw, final) -> None:
     """A recovery exit whose text is already the unflushed tail row (the iteration-budget summary, a
     stop gate's answer kept as the budget fallback) stores the rewrite the user gets, not the model
-    text (#44239). A held turn's hidden answer becomes the published reply; the model already saw
-    it, so ``api_content`` keeps its bytes on the wire."""
+    text (#44239). A held turn's hidden answer, or a draft a reply check hid, becomes the published
+    reply; the model already saw it, so ``api_content`` keeps its bytes on the wire."""
     tail = messages[-1] if messages else None
     if not (isinstance(tail, dict) and tail.get("role") == "assistant" and tail.get("content") == raw
             and not tail.get(_DB_PERSISTED_MARKER)):
         return
-    if tail.get("display_kind") == "hidden" and getattr(agent, "_hold_stream", False) is True:
+    if tail.get("display_kind") == "hidden" and (
+            getattr(agent, "_hold_stream", False) is True or tail.get("finish_reason") == "verify_hook_continue"):
         del tail["display_kind"]
         if final != raw:
             tail.setdefault("api_content", raw)
