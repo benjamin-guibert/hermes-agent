@@ -916,6 +916,8 @@ class GatewayAdapterLifecycleMixin(GatewaySecondaryReconnectMixin):
             recover_api_turns(adapter)
         self._sync_voice_mode_state_to_adapter(adapter)
         self._bind_voice_input_callback(adapter)
+        from gateway.session_lost_chat_turn import redrive_adapter_pauses
+        redrive_adapter_pauses(self, platform)
 
     async def _install_reconnected_adapter(self, platform, adapter) -> None:
         """Publish a freshly reconnected primary adapter and replay what it missed while down."""

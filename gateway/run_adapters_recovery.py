@@ -350,6 +350,8 @@ class GatewaySecondaryReconnectMixin:
                         if platform not in profile_map:
                             profile_map[platform] = adapter
                             hand_over_held_inbound(predecessor, adapter)
+                            from gateway.session_lost_chat_turn import redrive_adapter_pauses
+                            redrive_adapter_pauses(self, platform)
                             self._sync_voice_mode_state_to_adapter(adapter)
                             logger.info("✓ %s reconnected (profile: %s)", platform.value, profile_name)
                             await self._redeliver_failed_obligations_for_platform(

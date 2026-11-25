@@ -749,6 +749,8 @@ async def recover_profile_native_sessions(runner, authority):
     # publication and task creation stay on the owner loop, under the same scope as the scan.
     with owner_scope(authority):
         _prime_recovered_egress(bindings)
+        from gateway.session_lost_chat_turn import send_owed_lines
+        await send_owed_lines(runner, authority)  # before the queued messages it announces run
         outcome = await authority.recover_native_sessions(bindings)
         outcome.update(dict.fromkeys(recover_detached_sessions(authority, pending - set(outcome)), 'detached'))
     for sid, verdict in outcome.items():

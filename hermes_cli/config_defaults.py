@@ -2087,6 +2087,7 @@ DEFAULT_CONFIG = {
         "sessiondb_loop_guard": "off",
         # Allow all users without allowlists (security opt-in).
         "allow_all_users": False,
+        "messaging_auto_discard_lost_turns": True,  # a person's lost turn in a messaging chat settles like /discard
         # Bot-to-bot loop guard: max_events per window before a cooldown; max_hops bot messages per exchange.
         "bot_loop_guard": {"enabled": True, "max_events": 20, "window_seconds": 300, "cooldown_seconds": 600, "max_hops": 4, "bot_replies_expect_reply": False},
         # Startup-liveness watchdog: stdlib-only daemon thread armed at process entry that

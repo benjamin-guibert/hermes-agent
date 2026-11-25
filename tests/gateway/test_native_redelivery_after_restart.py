@@ -124,6 +124,8 @@ async def test_redelivery_of_a_turn_lost_mid_run_tells_the_chat_it_is_paused(tmp
     admission, so the chat gets the pause notice naming the way out, not a generic refusal."""
     from gateway.platforms.event import MessageEvent
     from gateway.session_authority import admission_row
+    # The pause contract; with the switch on, boot settles the lost chat turn by itself.
+    (tmp_path / 'config.yaml').write_text('gateway:\n  messaging_auto_discard_lost_turns: false\n')
     runner, adapter, sent, calls = await _gateway(tmp_path, monkeypatch)
     source, receipt = await _admitted_before_crash(runner, adapter, started=True)
     try:
