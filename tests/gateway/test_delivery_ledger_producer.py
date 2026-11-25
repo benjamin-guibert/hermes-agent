@@ -149,13 +149,12 @@ class TestProducerHook:
         runner._delivery_adapter_for.side_effect = [adapter, replacement]
         runner._redeliver_failed_obligations_for_platform = AsyncMock(return_value=1)
         adapter.gateway_runner = runner
-        adapter.send = AsyncMock(
-            return_value=SendResult(
-                success=False,
-                error="send_path_degraded",
-                retryable=True,
-            )
-        )
+        async def disconnected_send(*args, **kwargs):
+            # The complete real final path holds this pin during settlement.
+            from gateway.platforms.event import current_reply_trigger
+            assert current_reply_trigger.get()[2] is adapter
+            return SendResult(success=False, error="send_path_degraded", retryable=True)
+        adapter.send = AsyncMock(side_effect=disconnected_send)
 
         await _run(adapter, _event())
 
@@ -164,6 +163,8 @@ class TestProducerHook:
         runner._redeliver_failed_obligations_for_platform.assert_awaited_once_with(
             Platform.SLACK, profile="reviewer"
         )
+
+        assert runner._delivery_adapter_for.call_count == 2
 
 
     @pytest.mark.asyncio

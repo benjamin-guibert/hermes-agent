@@ -135,7 +135,14 @@ async def resolve_rest_route(aiohttp, pconfig, chat_id, thread_id, message, capt
             message = prefix + message
         else:
             caption = prefix + (caption or "")
+    message, caption = fit_redirected_caption(message, caption)
     return RestDeliveryRoute(str(parent), None, message, caption, True, cache, mentions)
+
+
+def fit_redirected_caption(message, caption):
+    if caption and len(caption) > 2000:
+        return caption, None
+    return message, caption
 
 
 async def post_rest_text(session, url, chunks, reader, headers, request_kwargs, mentions, redirect_cache, ids):
@@ -170,9 +177,9 @@ async def post_rest_file(aiohttp, session, url, path, caption, mentions, headers
         await asyncio.to_thread(file.close)
 
 
-async def post_missing_caption(session, url, caption, headers, request_kwargs, reader, limit, ids, redirect_cache):
+async def post_missing_caption(session, url, caption, headers, request_kwargs, reader, limit, ids, redirect_cache, mentions=None):
     try:
-        async with session.post(url, headers=headers, json={"content": caption}, **request_kwargs) as response:
+        async with session.post(url, headers=headers, json={"content": caption, **({"allowed_mentions": mentions} if isinstance(mentions, dict) else {})}, **request_kwargs) as response:
             if response.status not in (200, 201):
                 return None
             data = await reader(response, limit)

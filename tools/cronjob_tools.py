@@ -525,6 +525,17 @@ def _run_session_usage(job_id: str, execution_id: Optional[str]) -> dict[str, An
     return {"api_calls": sum(int(r.api_call_count or 0) for r in rows), **({"model": model} if model else {})}
 
 
+def _completion_output_allowed(deliver, job):
+    if not deliver or deliver == "local":
+        return True
+    if job.get("last_delivery_unverified") or job.get("last_delivery_queued"):
+        return False
+    outcome = job.get("last_delivery_outcome")
+    if outcome is not None:
+        return outcome == "none"
+    return job.get("last_delivery_reached_none") is True
+
+
 def _manual_run_completion(
     res: dict[str, Any], job_id: str, job_name: str, deliver: str, started_at: float,
     execution_id: Optional[str] = None) -> dict[str, Any]:
@@ -544,7 +555,7 @@ def _manual_run_completion(
     # target. Repeating an externally delivered payload here leaks it into a second, possibly
     # unrelated chat/thread. Keep it only when nobody else got it: a local job, or a delivery that
     # failed on EVERY target (a partial failure already posted the output somewhere).
-    reached_nobody = not deliver or deliver == "local" or refreshed.get("last_delivery_reached_none")
+    reached_nobody = _completion_output_allowed(deliver, refreshed)
     excerpt = _latest_job_output_excerpt(job_id) if reached_nobody else None
     if excerpt:
         lines += ["--- JOB OUTPUT ---", excerpt]

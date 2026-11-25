@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager, nullcontext
 from dataclasses import replace
 
 from gateway.platforms.event import MessageEvent, ProcessingOutcome
+from gateway.platforms.base_delivery_ledger import final_reply_scope
 from gateway.session_envelope import restore_native
 from gateway.session_producer_lifecycle import (
     close_observed_turn, close_producer_turn, close_settled_turn, producer_turn)
@@ -525,13 +526,14 @@ async def deliver_response(adapter, event, session_key, response):
         return True
     extracted = await adapter._extract_response_content(text, event, session_key, is_ephemeral_response=ttl > 0)
     metadata = _mark_notify_metadata(_thread_metadata_for_event(event))
-    results = []
-    if extracted.text_content:
-        await adapter._send_final_text(event, session_key, extracted.text_content,
-                                       metadata, ttl > 0, ttl, results.append)
-    await adapter._deliver_attachments(event, extracted, metadata, anything_sent=bool(results),
-                                       record_delivery=results.append)
-    return any(getattr(result, 'success', False) for result in results if result is not None)
+    with final_reply_scope(adapter, event):
+        results = []
+        if extracted.text_content:
+            await adapter._send_final_text(event, session_key, extracted.text_content,
+                                           metadata, ttl > 0, ttl, results.append)
+        await adapter._deliver_attachments(event, extracted, metadata, anything_sent=bool(results),
+                                           record_delivery=results.append)
+        return any(getattr(result, 'success', False) for result in results if result is not None)
 
 
 async def _run_own_post_delivery(adapter, session_key, event):

@@ -1038,6 +1038,7 @@ def _record_delivery_verification(job: dict, unverified_targets: list) -> None:
               if receipt["status"] in ("queued", "claimed")} or None
     values = {key: value for key, value in {
         "last_delivery_unverified": new_value, "last_delivery_queued": queued,
+        "last_delivery_outcome": job.pop("_delivery_outcome", None),
         "last_delivery_reached_none": job.pop("_delivery_reached_none", None) or None,
     }.items() if (job.get(key) or None) != value}
     if not values:
@@ -1048,6 +1049,18 @@ def _record_delivery_verification(job: dict, unverified_targets: list) -> None:
         update_job(job["id"], values)
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("Job '%s': could not record delivery verification: %s", job.get("id"), exc)
+
+
+def _record_delivery_outcome(job, reached, errors, unverified):
+    if unverified:
+        outcome = "unknown"
+    elif reached:
+        outcome = "partial" if errors else "reached"
+    else:
+        outcome = "none" if errors else "reached"
+    job["_delivery_outcome"] = outcome
+    job["_delivery_reached_none"] = outcome == "none"
+    _record_delivery_verification(job, unverified)
 
 
 @dataclass
@@ -1084,6 +1097,7 @@ class _TargetDelivery:
     # Telegram's "Not connected" is retryable while the bot client rebuilds, permanent when the fatal
     # is not — so the queue gate keys on this flag, not on widening a string set.
     live_retryable: Optional[bool] = None
+    replay_blocked: bool = False  # guarded unknown outcome: no alternate transport may replay
     standalone_in_flight: bool = False  # the standalone send may have delivered (timeout, lost answer, partial)
 
     @property
@@ -1302,14 +1316,19 @@ def _live_send_text(
     except PartialDeliveryError as ex:
         # The head of a split send is already on screen: a standalone resend would duplicate it.
         raw = getattr(ex.result, "raw_response", None) or {}
+        if raw.get("chat_id"):
+            t.delivery_receipt = raw
         _note_target_error(
             job, f"live adapter send to {t.where} delivered {raw.get('delivered_chunks', '?')} of "
             f"{raw.get('total_chunks', '?')} chunks, then failed: {ex}", delivery_errors)
-        return True, False, None
+        ids = raw.get("message_ids") or []
+        return True, False, ids[0] if ids else None
     except Exception as ex:
         # Real send error (not a slow confirmation): fall through to standalone. The router raises
         # a failed SendResult's error string, so this is where send_path_degraded arrives. The
         # adapter's retryable verdict rides DeliverySendError.send_retryable (None if it didn't).
+        if _retain_guarded_unknown(t, ex, delivery_errors, unverified_targets):
+            return False, False, None
         t.live_error = str(ex)
         t.live_retryable = getattr(ex, "send_retryable", None)
         target_errors.append(f"live adapter send failed: {ex}")
@@ -1352,6 +1371,24 @@ def _live_send_text(
             f"{t.where} was not found; delivered without thread_id",
             delivery_errors)
     return True, False, delivered_message_id
+
+
+def _retain_guarded_unknown(t, error, delivery_errors, unverified_targets):
+    raw = getattr(getattr(error, "result", None), "raw_response", None)
+    if (t.platform != Platform.DISCORD or not isinstance(raw, dict)
+            or raw.get("progress_contract") not in ("discord.archived_redirect.v1", "discord.delivery_hold.v1")
+            or raw.get("resume_safe") is not False):
+        return False
+    t.delivery_receipt = raw
+    t.replay_blocked = True
+    t.live_error = str(error)
+    t.live_retryable = False
+    message = f"unconfirmed delivery to {t.platform_name}:{raw.get('chat_id')}; automatic replay refused"
+    _note_target_error(t.job, message, delivery_errors)
+    unverified_targets.append(t.where)
+    logger.warning("Job '%s': unconfirmed to %s:%s confirmed_ids=%s", t.job["id"],
+                   t.platform_name, raw.get("chat_id"), raw.get("message_ids", []))
+    return True
 
 
 def _resolve_named_dm_topic(t: _TargetDelivery, topic_name: str, metadata: dict, delivery_errors: list,
@@ -1533,6 +1570,8 @@ def _deliver_standalone(
     """Standalone fallback for a target the live lane did not deliver; True once the text was sent,
     in full or in part (a split send that failed after a chunk landed)."""
     job = t.job
+    if t.replay_blocked:
+        return False
     if t.is_relay:
         # Relay owns the destination and credential; a native retry could duplicate — fail closed.
         if not target_errors:
@@ -1902,8 +1941,7 @@ def _deliver_result(
         job["_notification_all_targets_suppressed"] = True
     else:
         delivery_errors.extend(policy_drop_errors)
-    job["_delivery_reached_none"] = bool(delivery_errors) and not reached
-    _record_delivery_verification(job, unverified_targets)
+    _record_delivery_outcome(job, reached, delivery_errors, unverified_targets)
     return "; ".join(delivery_errors) if delivery_errors else None
 
 

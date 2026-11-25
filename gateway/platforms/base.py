@@ -3484,19 +3484,21 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
             return contextlib.nullcontext()
 
     def _final_delivery_adapter(self, source: Optional[SessionSource]) -> "BasePlatformAdapter":
-        """The runner's CURRENT adapter for a new final-response send: a reconnect can swap the
-        registry adapter mid-task; an unsent final response belongs on the replacement transport,
-        while message IDs, edits and deletes stay owned by the old one (nothing is migrated)."""
+        """Keep one reply on its pinned transport; otherwise use the current registry."""
         scope = current_reply_trigger.get()
         if isinstance(scope, tuple) and len(scope) == 4 and scope[1] is asyncio.current_task():
             return scope[2]
+        return self._registry_delivery_adapter(source)
+
+    def _registry_delivery_adapter(self, source: Optional[SessionSource]) -> "BasePlatformAdapter":
+        """Resolve the runner registry without inheriting an in-flight reply's pin."""
         resolve = getattr(self.gateway_runner, "_delivery_adapter_for", None)
         if not callable(resolve):
             return self
         try:
             live_adapter = resolve(source)
         except Exception:
-            logger.debug("[%s] Failed to resolve live adapter for final delivery", self.name)
+            logger.debug("[%s] Failed to resolve live adapter for final delivery", self.name, exc_info=True)
             return self
         if isinstance(live_adapter, BasePlatformAdapter) and live_adapter.platform == self.platform:
             return live_adapter

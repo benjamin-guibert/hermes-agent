@@ -132,7 +132,7 @@ async def finalize_final_obligation(adapter: Any, obligation_id: str, result: An
             return
         error = str(getattr(result, "error", "") or "")
         raw = getattr(result, "raw_response", None) or {}
-        receipt = receipt_json(result) if raw.get("progress_contract") else None
+        receipt = receipt_json(result) if raw.get("progress_contract") or raw.get("prevent_fallback") else None
         if receipt is None:
             await asyncio.to_thread(mark_failed, obligation_id, error)
         else:
@@ -140,7 +140,7 @@ async def finalize_final_obligation(adapter: Any, obligation_id: str, result: An
         if is_reconnect_only(error):
             redeliver = getattr(
                 adapter.gateway_runner, "_redeliver_failed_obligations_for_platform", None)
-            live = adapter._final_delivery_adapter(event.source)
+            live = adapter._registry_delivery_adapter(event.source)
             if live is not delivery_adapter and callable(redeliver):
                 await redeliver(event.source.platform,
                                 profile=getattr(delivery_adapter, "_owner_profile", None))

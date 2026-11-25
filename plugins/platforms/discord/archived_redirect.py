@@ -8,6 +8,7 @@ from datetime import datetime
 
 from gateway.platforms.event import current_reply_trigger
 from gateway.outbound.operation import outbound_operation
+from plugins.platforms.discord.adapter_archived_status import skip_status_in_archived_thread
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -48,14 +49,10 @@ def permits_current_human_reply(adapter: Any, channel: Any, reply_to: Any, metad
             and trigger.created_at > archived_at)
 
 
-async def redirect_archived_send(adapter: Any, channel: Any, content: str, reply_to: Any = None, metadata: Any = None) -> tuple[Any, str, bool]:
-    """Return the actual destination and text for one logical send."""
+async def refresh_thread_for_send(adapter, channel):
     from plugins.platforms.discord import adapter as facade
-
-    if adapter.config.extra.get(CONFIG_KEY, True) is False:
-        return channel, content, False
-    if not isinstance(channel, facade.discord.Thread):
-        return channel, content, False
+    if adapter.config.extra.get(CONFIG_KEY, True) is False or not isinstance(channel, facade.discord.Thread):
+        return channel, None
     scope = current_reply_trigger.get()
     operation = outbound_operation.get()
     routes = scope[3] if isinstance(scope, tuple) and len(scope) == 4 and scope[1] is asyncio.current_task() else operation
@@ -73,6 +70,26 @@ async def redirect_archived_send(adapter: Any, channel: Any, content: str, reply
         if isinstance(routes[key], Exception):
             raise routes[key]
         channel = routes[key]
+    return channel, routes
+
+
+async def resolve_text_send(adapter, channel, content, reply_to, metadata, nonconversational):
+    skipped = skip_status_in_archived_thread(adapter.config.extra, channel, nonconversational)
+    if skipped is None:
+        channel, _routes = await refresh_thread_for_send(adapter, channel)
+        skipped = skip_status_in_archived_thread(adapter.config.extra, channel, nonconversational)
+    if skipped is not None:
+        return channel, content, False, skipped
+    channel, content, redirected = await redirect_archived_send(adapter, channel, content, reply_to, metadata)
+    return channel, content, redirected, None
+
+
+async def redirect_archived_send(adapter: Any, channel: Any, content: str, reply_to: Any = None, metadata: Any = None) -> tuple[Any, str, bool]:
+    """Return the actual destination and text for one logical send."""
+    from plugins.platforms.discord import adapter as facade
+    if adapter.config.extra.get(CONFIG_KEY, True) is False or not isinstance(channel, facade.discord.Thread):
+        return channel, content, False
+    channel, routes = await refresh_thread_for_send(adapter, channel)
     archived = getattr(channel, "archived", None)
     if type(archived) is not bool:
         raise ValueError("Unknown Discord thread archive state; delivery refused")

@@ -13,8 +13,9 @@ adapter = adapter_fixture
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("lane", ["background", "settled"])
 @pytest.mark.parametrize("kind", ["human", "bot", "rearchive", "replacement", "stale-active", "refresh-error", "retry"])
-async def test_final_text_and_document(adapter, monkeypatch, tmp_path, kind):
+async def test_final_text_and_document(adapter, monkeypatch, tmp_path, kind, lane):
     monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
     monkeypatch.setenv("DISCORD_THREAD_REQUIRE_MENTION", "false")
     monkeypatch.setenv("DISCORD_HISTORY_BACKFILL", "false")
@@ -62,7 +63,11 @@ async def test_final_text_and_document(adapter, monkeypatch, tmp_path, kind):
     adapter._fire_post_delivery_callback = AsyncMock()
     adapter._flush_text_debounce_now = AsyncMock()
     adapter._finish_session_task = lambda *a: None
-    await adapter._process_message_background(event, "pipeline-session")
+    if lane == "settled":
+        from gateway.session_ingress import deliver_response
+        await deliver_response(adapter, event, "pipeline-session", f"reply\nMEDIA:{file}")
+    else:
+        await adapter._process_message_background(event, "pipeline-session")
     if kind == "refresh-error":
         thread.send.assert_not_awaited()
         parent.send.assert_not_awaited()
@@ -85,6 +90,13 @@ async def test_final_text_and_document(adapter, monkeypatch, tmp_path, kind):
         assert receipt["chat_id"] == str(destination.id)
         assert receipt["message_ids"] == ["9001" if destination is thread else "9002"]
     assert live._client.fetch_channel.await_count == 1
+    if lane == "settled" and kind in ("human", "replacement"):
+        thread.send.reset_mock()
+        parent.send.reset_mock()
+        unrelated = await live.send("4001", "background notice", metadata={"thread_id": "4001"})
+        assert unrelated.success and unrelated.raw_response["chat_id"] == "4000"
+        thread.send.assert_not_awaited()
+        assert parent.send.await_args.kwargs["content"] == "<#4001>\nbackground notice"
 
 
 @pytest.mark.asyncio
@@ -98,6 +110,7 @@ async def test_reply_file_cleanup_uses_actual_parent(adapter, tmp_path):
     thread.send = AsyncMock()
     adapter._client.fetch_channel = AsyncMock(return_value=thread)
     adapter._resolve_channel = AsyncMock(side_effect=lambda target: parent if str(target) == "4000" else thread)
+    adapter._client.fetch_channel = AsyncMock(return_value=thread)
     path = tmp_path / "reply.txt"
     path.write_text("reply")
     result = await adapter.send_reply_document("4001", str(path), metadata={"thread_id": "4001"})
@@ -117,6 +130,7 @@ async def test_partial_parent_text_does_not_replay_visible_head(adapter):
     thread.archived = True
     thread.send = AsyncMock()
     adapter._resolve_channel = AsyncMock(side_effect=lambda target: parent if str(target) == "4000" else thread)
+    adapter._client.fetch_channel = AsyncMock(return_value=thread)
     result = await adapter._send_with_retry("4001", "first " * 600, metadata={"thread_id": "4001"}, base_delay=0)
     assert result.success
     assert result.raw_response["message_ids"] == ["9002", "9003"]
@@ -175,6 +189,7 @@ async def test_failed_parent_progress_survives_new_adapter(adapter, monkeypatch,
     thread.archived = True
     thread.send = AsyncMock()
     adapter._resolve_channel = AsyncMock(side_effect=lambda target: parent if str(target) == "4000" else thread)
+    adapter._client.fetch_channel = AsyncMock(return_value=thread)
     source = SessionSource(platform=Platform.DISCORD, chat_id="4001", thread_id="4001", user_id="6000")
     event = MessageEvent(text="request", source=source, message_id="7001")
     result, _ = await adapter.send_final_ledgered(event, "recovery-session", "first " * 600,
@@ -244,6 +259,7 @@ async def test_real_reply_file_loss_cleans_parent_then_falls_back_with_link(adap
     thread.send = AsyncMock()
     adapter._client.fetch_channel = AsyncMock(return_value=thread)
     adapter._resolve_channel = AsyncMock(side_effect=lambda target: parent if str(target) == "4000" else thread)
+    adapter._client.fetch_channel = AsyncMock(return_value=thread)
     adapter.MAX_SPLIT_MESSAGES = 2
     source = SessionSource(platform=Platform.DISCORD, chat_id="4001", thread_id="4001", user_id="6000")
     event = MessageEvent(text="request", source=source, message_id="7001")
@@ -259,3 +275,95 @@ async def test_real_reply_file_loss_cleans_parent_then_falls_back_with_link(adap
     assert results[0].raw_response["chat_id"] == "4000"
     assert _rows()[0]["state"] == "delivered"
     thread.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["success", "multipart", "unknown", "partial-unknown"])
+async def test_reply_file_final_receipt_and_recovery(adapter, monkeypatch, outcome):
+    from gateway import delivery_ledger as ledger
+    from gateway.config import Platform
+    from gateway.platforms.event import MessageEvent
+    from gateway.session import SessionSource
+    from gateway.run import GatewayRunner
+    from plugins.platforms.discord.adapter import DiscordAdapter
+    adapter.MAX_SPLIT_MESSAGES = 2
+    if outcome in ("multipart", "partial-unknown"):
+        adapter.REPLY_FILE_MAX_BYTES = 3000
+    parent = FakeTextChannel(channel_id=4000)
+    parent.send = AsyncMock(return_value=SimpleNamespace(id=9001, attachments=[object()]))
+    if outcome == "unknown":
+        parent.send.side_effect = TimeoutError("ack lost")
+    elif outcome == "partial-unknown":
+        parent.send.side_effect = [SimpleNamespace(id=9001, attachments=[object()]), TimeoutError("ack lost")]
+    thread = FakeThread(channel_id=4001, parent=parent)
+    thread.archived = True
+    thread.send = AsyncMock()
+    adapter._resolve_channel = AsyncMock(return_value=thread)
+    adapter._client.fetch_channel = AsyncMock(return_value=thread)
+    event = MessageEvent(text="request", message_id="7001", source=SessionSource(
+        platform=Platform.DISCORD, chat_id="4001", thread_id="4001", user_id="6000"))
+    result, _ = await adapter.send_final_ledgered(event, "file-session", "x" * 6100,
+                                                {"thread_id": "4001"}, reply_to="7001")
+    row = _rows()[0]
+    saved = json.loads(ledger.get_delivery_receipt(row["obligation_id"]))
+    assert saved["chat_id"] == "4000" and saved["thread_id"] is None
+    assert row["chat_id"] == "4001" and row["session_key"] == "file-session"
+    expected = [] if outcome == "unknown" else ["9001"] * (3 if outcome == "multipart" else 1)
+    assert saved["message_ids"] == expected
+    if "unknown" in outcome:
+        assert not result.success and saved["prevent_fallback"] is True
+        parent.send.reset_mock()
+        fresh = DiscordAdapter(adapter.config)
+        fresh._client = adapter._client
+        fresh._resolve_channel = adapter._resolve_channel
+        monkeypatch.setattr(ledger, "_owner_alive", lambda *args: False)
+        monkeypatch.setattr(ledger, "_owner_stamp", lambda: (999999, 303))
+        runner = SimpleNamespace(_obligation_adapter=AsyncMock(return_value=fresh),
+                                 _arm_flood_timers_for_waiting_rows=AsyncMock())
+        assert await GatewayRunner._redeliver_claimed_obligations(runner, ledger.sweep_recoverable()) == 0
+        parent.send.assert_not_awaited()
+    else:
+        assert result.success and row["state"] == "delivered"
+    thread.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_final_review_2_receiptless_part2_keeps_hold(adapter, monkeypatch):
+    from gateway import delivery_ledger as ledger
+    from gateway.config import Platform
+    from gateway.platforms.event import MessageEvent
+    from gateway.session import SessionSource
+    from gateway.run import GatewayRunner
+    from plugins.platforms.discord.adapter import DiscordAdapter
+    adapter.MAX_SPLIT_MESSAGES = 2
+    adapter.REPLY_FILE_MAX_BYTES = 3000
+    parent = FakeTextChannel(channel_id=4000)
+    async def acknowledged_then_disconnect(**kwargs):
+        adapter._client = None
+        return SimpleNamespace(id=9001, attachments=[object()])
+    parent.send = AsyncMock(side_effect=acknowledged_then_disconnect)
+    thread = FakeThread(channel_id=4001, parent=parent)
+    thread.archived = True
+    adapter._resolve_channel = AsyncMock(return_value=thread)
+    adapter._client.fetch_channel = AsyncMock(return_value=thread)
+    event = MessageEvent(text="request", message_id="7001", source=SessionSource(
+        platform=Platform.DISCORD, chat_id="4001", thread_id="4001", user_id="6000"))
+    result, _ = await adapter.send_final_ledgered(event, "receiptless-session", "x" * 6100,
+                                                {"thread_id": "4001"}, reply_to="7001")
+    assert not result.success
+    saved = json.loads(ledger.get_delivery_receipt(_rows()[0]["obligation_id"]))
+    assert saved["chat_id"] == "4000" and saved["message_ids"] == ["9001"]
+    assert saved["prevent_fallback"] is True
+    parent.send.assert_awaited_once()
+    assert parent.send.await_args.kwargs["files"]
+    fresh = DiscordAdapter(adapter.config)
+    fresh._client = SimpleNamespace(user=SimpleNamespace(id=999), fetch_channel=AsyncMock(return_value=thread))
+    fresh._resolve_channel = AsyncMock(return_value=thread)
+    monkeypatch.setattr(ledger, "_owner_alive", lambda *args: False)
+    monkeypatch.setattr(ledger, "_owner_stamp", lambda: (999999, 303))
+    runner = SimpleNamespace(_obligation_adapter=AsyncMock(return_value=fresh),
+                             _arm_flood_timers_for_waiting_rows=AsyncMock())
+    assert await GatewayRunner._redeliver_claimed_obligations(runner, ledger.sweep_recoverable()) == 0
+    parent.send.assert_awaited_once()
+    fresh._resolve_channel.assert_not_awaited()
+    assert _rows()[0]["chat_id"] == "4001" and _rows()[0]["session_key"] == "receiptless-session"

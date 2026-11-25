@@ -104,10 +104,20 @@ class _StreamingAiohttpResponse:
         self.closed = True
 
 
+def _discord_channel_state(url, **kwargs):
+    channel_id = url.rstrip("/").rsplit("/", 1)[-1]
+    channel_type = 15 if channel_id == "forum_ch" else 11 if channel_id in ("555444333", "999") else 0
+    state = {"id": channel_id, "type": channel_type}
+    if channel_type == 11:
+        state["thread_metadata"] = {"archived": False}
+    return _StreamingAiohttpResponse(200, json.dumps(state).encode())
+
+
 class _StreamingAiohttpSession:
     def __init__(self, response: _StreamingAiohttpResponse):
         self.response = response
         self.post = MagicMock(return_value=response)
+        self.get = MagicMock(side_effect=_discord_channel_state)
 
     async def __aenter__(self):
         return self
@@ -1074,6 +1084,7 @@ class TestSendDiscordThreadId:
         mock_session.__aenter__ = AsyncMock(return_value=mock_session)
         mock_session.__aexit__ = AsyncMock(return_value=None)
         mock_session.post = MagicMock(return_value=mock_resp)
+        mock_session.get = MagicMock(side_effect=_discord_channel_state)
 
         return mock_session, mock_resp
 
@@ -1127,6 +1138,7 @@ class TestSendDiscordMedia:
         mock_session.__aenter__ = AsyncMock(return_value=mock_session)
         mock_session.__aexit__ = AsyncMock(return_value=None)
         mock_session.post = MagicMock(return_value=mock_resp)
+        mock_session.get = MagicMock(side_effect=_discord_channel_state)
 
         return mock_session, mock_resp
 
@@ -1225,7 +1237,7 @@ class TestSendDiscordForum:
         mock_session.__aenter__ = AsyncMock(return_value=mock_session)
         mock_session.__aexit__ = AsyncMock(return_value=None)
         mock_session.post = MagicMock(return_value=mock_resp)
-        mock_session.get = MagicMock(return_value=mock_resp)
+        mock_session.get = MagicMock(side_effect=_discord_channel_state)
 
         return mock_session, mock_resp
 
@@ -1302,6 +1314,7 @@ class TestSendDiscordForumMedia:
         session.__aenter__ = AsyncMock(return_value=session)
         session.__aexit__ = AsyncMock(return_value=None)
         session.post = MagicMock(return_value=thread_resp)
+        session.get = MagicMock(side_effect=_discord_channel_state)
 
         post_calls = []
 
@@ -1337,6 +1350,7 @@ class TestSendDiscordForumMedia:
         session.__aenter__ = AsyncMock(return_value=session)
         session.__aexit__ = AsyncMock(return_value=None)
         session.post = MagicMock(return_value=thread_resp)
+        session.get = MagicMock(side_effect=_discord_channel_state)
 
         with patch("aiohttp.ClientSession", return_value=session):
             result = asyncio.run(

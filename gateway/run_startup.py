@@ -19,6 +19,7 @@ from contextvars import copy_context
 from pathlib import Path
 from agent.i18n import t
 from gateway.config import Platform
+from gateway.outbound.operation import outbound_delivery_scope
 from gateway.delivery import looks_like_telegram_private_chat_id, prime_revived_egress
 from gateway.platforms.base import BasePlatformAdapter
 from gateway.platforms.event import MessageEvent, MessageType
@@ -500,12 +501,13 @@ class GatewayStartupMixin:
                 receipt = await asyncio.to_thread(get_delivery_receipt, row["obligation_id"])
                 progress_scope = current_delivery_obligation.set((row["obligation_id"], asyncio.current_task()))
                 try:
-                    if row["platform"] == "discord" and receipt is not None and guarded_progress_receipt(receipt):
-                        await asyncio.to_thread(checkpoint_recovered_attempt, row["obligation_id"], receipt)
-                        resume = getattr(adapter, "resume_delivery_receipt", None)
-                        result = await resume(receipt) if callable(resume) else None
-                    else:
-                        result = await adapter.send(chat_id=row["chat_id"], content=content, metadata=metadata)
+                    with outbound_delivery_scope():
+                        if row["platform"] == "discord" and receipt is not None and guarded_progress_receipt(receipt):
+                            await asyncio.to_thread(checkpoint_recovered_attempt, row["obligation_id"], receipt)
+                            resume = getattr(adapter, "resume_delivery_receipt", None)
+                            result = await resume(receipt) if callable(resume) else None
+                        else:
+                            result = await adapter.send(chat_id=row["chat_id"], content=content, metadata=metadata)
                 finally:
                     current_delivery_obligation.reset(progress_scope)
             except Exception as send_err:

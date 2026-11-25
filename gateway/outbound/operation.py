@@ -5,6 +5,8 @@ Plugins read ``outbound_operation`` for a cache shared by one logical send.
 permission. Call it at an external delivery boundary, not for each chunk.
 The state is task-local and must not be retained after the operation.
 """
+import asyncio
+
 from contextlib import contextmanager
 from contextvars import ContextVar
 from functools import wraps
@@ -16,7 +18,11 @@ outbound_operation = ContextVar("outbound_operation", default=None)
 
 @contextmanager
 def outbound_delivery_scope():
-    token = outbound_operation.set({})
+    try:
+        owner = asyncio.current_task()
+    except RuntimeError:
+        owner = None
+    token = outbound_operation.set({"_task": owner})
     human = current_reply_trigger.set(None)
     try:
         yield

@@ -67,5 +67,9 @@ def test_standalone_send_result_never_carries_the_proxy_secret(monkeypatch, send
         result = asyncio.run(asyncio.wait_for(SENDERS[sender](monkeypatch, proxy), 30))
     text = json.dumps(result)
     assert result.get("error"), result
-    assert " via " in result["error"], result  # the proxy-error path, not an unrelated failure
+    if sender == "discord":
+        # The archive guard reaches the proxy during its state GET, before POST.
+        assert result["error"] == "Cannot resolve Discord channel state; delivery refused"
+    else:
+        assert " via " in result["error"], result  # the proxy-error path, not an unrelated failure
     assert not _leaks(text), (_leaks(text), text)

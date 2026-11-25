@@ -284,7 +284,7 @@ def guarded_progress_receipt(receipt: str) -> bool:
     except (TypeError, ValueError):
         return True
     return not isinstance(raw, dict) or bool(set(raw) & {
-        "progress_contract", "origin_thread_id", "remaining_chunks", "resume_safe", "partial_overflow"})
+        "progress_contract", "origin_thread_id"})
 
 
 def checkpoint_delivery_progress(obligation_id: str, progress: dict) -> None:
@@ -325,8 +325,10 @@ def receipt_json(result) -> Optional[str]:
     raw = getattr(result, "raw_response", None)
     if not isinstance(raw, dict) or "chat_id" not in raw:
         return None
+    if raw.get("prevent_fallback"):
+        raw = {**raw, "progress_contract": "discord.delivery_hold.v1", "resume_safe": False}
     return json.dumps({key: raw[key] for key in (
-        "chat_id", "thread_id", "message_ids", "remaining_chunks", "resume_safe", "partial_overflow", "progress_contract", "origin_thread_id") if key in raw})
+        "chat_id", "thread_id", "message_ids", "remaining_chunks", "resume_safe", "partial_overflow", "progress_contract", "origin_thread_id", "prevent_fallback", "ambiguous") if key in raw})
 
 
 def release_runtime_claim(obligation_id: str, error: str = "") -> bool:

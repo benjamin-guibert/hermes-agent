@@ -45,7 +45,7 @@ async def test_crash_boundary_keeps_only_confirmed_progress(adapter, monkeypatch
     parent.send = AsyncMock(side_effect=post)
     def wire(target):
         target._resolve_channel = AsyncMock(side_effect=lambda channel_id: parent if str(channel_id) == "4000" else thread)
-        target._client = SimpleNamespace(user=SimpleNamespace(id=999))
+        target._client = SimpleNamespace(user=SimpleNamespace(id=999), fetch_channel=AsyncMock(return_value=thread))
         return target
     wire(adapter)
     original_checkpoint = ledger.checkpoint_delivery_progress
@@ -151,6 +151,7 @@ async def test_checkpoint_failure_prevents_post_and_whole_fallback(adapter, monk
     thread.archived = True
     thread.send = AsyncMock()
     adapter._resolve_channel = AsyncMock(return_value=thread)
+    adapter._client.fetch_channel = AsyncMock(return_value=thread)
     source = SessionSource(platform=Platform.DISCORD, chat_id="4001", thread_id="4001", user_id="6000")
     event = MessageEvent(text="request", source=source, message_id="7001")
     def refuse_checkpoint(*args):
@@ -180,7 +181,6 @@ async def test_ordinary_discord_failure_keeps_normal_recovery(adapter, monkeypat
     assert ledger.get_delivery_receipt(row["obligation_id"]) is None
     if old_receipt:
         ledger.mark_failed(row["obligation_id"], "send refused", json.dumps({"chat_id": "5000", "message_ids": []}))
-    channel.send.side_effect = None
     channel.send.return_value = SimpleNamespace(id=9001)
     channel.send.reset_mock()
     fresh = DiscordAdapter(adapter.config)
@@ -190,8 +190,44 @@ async def test_ordinary_discord_failure_keeps_normal_recovery(adapter, monkeypat
     monkeypatch.setattr(ledger, "_owner_stamp", lambda: (999999, 303))
     runner = SimpleNamespace(_obligation_adapter=AsyncMock(return_value=fresh),
                              _arm_flood_timers_for_waiting_rows=AsyncMock())
+    assert await GatewayRunner._redeliver_claimed_obligations(runner, ledger.sweep_recoverable()) == 0
+    channel.send.assert_awaited_once()
+    channel.send.side_effect = None
+    channel.send.reset_mock()
+    ledger.mark_failed(row["obligation_id"], "send_path_degraded")
     assert await GatewayRunner._redeliver_claimed_obligations(runner, ledger.sweep_recoverable()) == 1
     channel.send.assert_awaited_once()
     assert channel.send.await_args.kwargs["content"].endswith("ordinary reply")
     assert _rows()[0]["obligation_id"] == row["obligation_id"]
     assert _rows()[0]["state"] == "delivered"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("refresh_error", [False, True])
+async def test_ordinary_recovery_refreshes_cached_active_thread(adapter, monkeypatch, refresh_error):
+    parent = FakeTextChannel(channel_id=4000)
+    parent.send = AsyncMock(return_value=SimpleNamespace(id=9001))
+    cached = FakeThread(channel_id=4001, parent=parent)
+    cached.archived = False
+    cached.send = AsyncMock(return_value=SimpleNamespace(id=9002))
+    remote = FakeThread(channel_id=4001, parent=parent)
+    remote.archived = True
+    ledger.record_obligation(obligation_id="fresh-recovery", session_key="recovery-session", platform="discord",
+                             chat_id="4001", thread_id="4001", content="ordinary reply")
+    ledger.mark_failed("fresh-recovery", "send refused")
+    fresh = DiscordAdapter(adapter.config)
+    fresh._client = SimpleNamespace(user=SimpleNamespace(id=999), fetch_channel=AsyncMock(return_value=remote))
+    if refresh_error:
+        fresh._client.fetch_channel.side_effect = RuntimeError("refresh refused")
+    fresh._resolve_channel = AsyncMock(side_effect=lambda target: parent if str(target) == "4000" else cached)
+    monkeypatch.setattr(ledger, "_owner_alive", lambda *args: False)
+    monkeypatch.setattr(ledger, "_owner_stamp", lambda: (999999, 303))
+    runner = SimpleNamespace(_obligation_adapter=AsyncMock(return_value=fresh),
+                             _arm_flood_timers_for_waiting_rows=AsyncMock())
+    count = await GatewayRunner._redeliver_claimed_obligations(runner, ledger.sweep_recoverable())
+    cached.send.assert_not_awaited()
+    fresh._client.fetch_channel.assert_awaited_once_with(4001)
+    assert count == (0 if refresh_error else 1)
+    assert parent.send.await_count == (0 if refresh_error else 1)
+    if not refresh_error:
+        assert json.loads(ledger.get_delivery_receipt("fresh-recovery"))["chat_id"] == "4000"

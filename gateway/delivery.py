@@ -129,9 +129,10 @@ class DeliverySendError(RuntimeError):
     must not re-derive that verdict from the string, so it rides the exception.
     """
 
-    def __init__(self, message: str, *, retryable: bool = False):
+    def __init__(self, message: str, *, retryable: bool = False, result: Any = None):
         super().__init__(message)
         self.send_retryable = retryable
+        self.result = result
 
 
 @dataclass
@@ -372,5 +373,5 @@ class DeliveryRouter:
                 raise PartialDeliveryError(error, result)
             raise DeliverySendError(
                 error or f"{target.platform.value} delivery failed",
-                retryable=_result_field(result, "retryable") is True)
+                retryable=_result_field(result, "retryable") is True, result=result)
         return result

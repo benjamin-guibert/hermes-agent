@@ -1155,8 +1155,8 @@ class VoiceReceiver:
         )
 
 
-from plugins.platforms.discord.archived_redirect import capture_live_trigger, redirect_archived_send, PROGRESS_CONTRACT, make_redirect_progress, send_guarded_chunks, failed_guarded_chunks
-from plugins.platforms.discord.adapter_archived_status import archived_status_extra, skip_status_in_archived_thread
+from plugins.platforms.discord.archived_redirect import capture_live_trigger, resolve_text_send, PROGRESS_CONTRACT, make_redirect_progress, send_guarded_chunks, failed_guarded_chunks
+from plugins.platforms.discord.adapter_archived_status import archived_status_extra
 from plugins.platforms.discord.adapter_config_readers import (
     _DISCORD_PROMPT_TIMEOUT_DEFAULT, _DISCORD_PROMPT_TIMEOUT_MIN, _read_discord_prompt_timeout, _read_dm_role_auth_guild,
     _resolve_exec_approval_admin_gate)
@@ -1171,7 +1171,7 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return raw in {"true", "1", "yes", "on"}
 
 
-from plugins.platforms.discord.adapter_media import DiscordMediaMixin
+from plugins.platforms.discord.adapter_media import DiscordMediaMixin, media_operation
 from plugins.platforms.discord.standalone_rest import api_url as _rest_url, resolve_rest_route, post_rest_text, post_rest_file, post_missing_caption
 from plugins.platforms.discord.adapter_opus import load_opus_codec
 from plugins.platforms.discord.adapter_authorization import DiscordAuthorizationMixin, is_automated_message
@@ -3004,6 +3004,7 @@ class DiscordAdapter(DiscordLiveGatesMixin, DiscordCommandSyncMixin, DiscordAuth
             logger.debug("Could not build reply-to reference: %s", e)
             return None
 
+    @media_operation
     async def send(
         self,
         chat_id: str,
@@ -3040,10 +3041,11 @@ class DiscordAdapter(DiscordLiveGatesMixin, DiscordCommandSyncMixin, DiscordAuth
                 channel = await self._resolve_channel(chat_id)
                 if not channel:
                     return SendResult(success=False, error=f"Channel {chat_id} not found")
-            if (skipped := skip_status_in_archived_thread(self.config.extra, channel, nonconversational)) is not None:
-                return skipped
             original_target = str(channel.id)
-            channel, content, redirected = await redirect_archived_send(self, channel, content, reply_to, metadata)
+            channel, content, redirected, skipped = await resolve_text_send(
+                self, channel, content, reply_to, metadata, nonconversational)
+            if skipped is not None:
+                return skipped
             if redirected:
                 metadata = {**(metadata or {}), "reply_to_message_id": reply_to or (metadata or {}).get("reply_to_message_id")}
                 reply_to = None
@@ -6919,7 +6921,7 @@ async def _standalone_send(
                     if caption_pending:
                         fallback = await post_missing_caption(session, url, caption, json_headers, _req_kw,
                             _standalone_read_json_limited, _DISCORD_STANDALONE_JSON_BODY_LIMIT_BYTES,
-                            message_ids, route_cache if redirected else None)
+                            message_ids, route_cache if redirected else None, mentions)
                         if fallback is not None:
                             last_data, caption_pending = fallback, False
                     continue

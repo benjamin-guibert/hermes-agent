@@ -66,7 +66,9 @@ def media_operation(method):
     async def send(self, *args, **kwargs):
         scope = current_reply_trigger.get()
         in_final = isinstance(scope, tuple) and len(scope) == 4 and scope[1] is asyncio.current_task()
-        if outbound_operation.get() is not None or in_final:
+        operation = outbound_operation.get()
+        owned = operation is not None and operation.get("_task") in (None, asyncio.current_task())
+        if owned or in_final:
             return await method(self, *args, **kwargs)
         with outbound_delivery_scope():
             return await method(self, *args, **kwargs)
@@ -423,6 +425,7 @@ class DiscordMediaMixin:
                 if not fallback.success:
                     return fallback
                 message_ids.extend((fallback.raw_response or {}).get("message_ids", []))
+                redirect_prefix = ""
                 delivered = True
             finally:
                 if aiohttp_session is not None:

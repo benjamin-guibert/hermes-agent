@@ -28,7 +28,7 @@ def _discord():
         sent.append(kwargs.get("content", ""))
         return SimpleNamespace(id=len(sent))
 
-    channel = SimpleNamespace(send=AsyncMock(side_effect=fake_send))
+    channel = SimpleNamespace(id=555, send=AsyncMock(side_effect=fake_send))
     adapter._client = SimpleNamespace(get_channel=lambda _chat_id: channel, fetch_channel=AsyncMock())
 
     async def card_fails(**_kwargs):  # the button card could not be sent: the text fallback answers

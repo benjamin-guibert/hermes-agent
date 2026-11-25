@@ -310,3 +310,22 @@ def test_real_cron_native_voice_keeps_mode_and_partial_receipt(media_transport, 
         loop.call_soon_threadsafe(loop.stop)
         worker.join(timeout=5)
         loop.close()
+
+
+@pytest.mark.asyncio
+async def test_rejected_image_batch_then_next_batch_has_one_link(media_transport, tmp_path):
+    adapter, parent, _thread = media_transport
+    class Refused(Exception):
+        status = 400
+    paths = [tmp_path / f"image-{index}.png" for index in range(11)]
+    for path in paths:
+        path.write_bytes(b"image")
+    parent.send.side_effect = [Refused("batch rejected")] + [
+        SimpleNamespace(id=9100 + index, attachments=[object()]) for index in range(11)]
+    result = await adapter.send_multiple_images("4001", [(path.as_uri(), "caption") for path in paths],
+                                                metadata={"thread_id": "4001"})
+    assert result.success
+    assert result.raw_response["message_ids"] == [str(9100 + index) for index in range(11)]
+    assert result.raw_response["chat_id"] == "4000"
+    texts = [call.kwargs.get("content") or "" for call in parent.send.await_args_list[1:]]
+    assert sum(text.count("<#4001>") for text in texts) == 1

@@ -1295,13 +1295,18 @@ async def send_reply_as_file(adapter: Any, chat_id: str, text: str, *, reply_to:
             result = await send(chat_id, path, caption=t("platform.shared.response_as_file") if index == 1 else None,
                                 file_name=name, reply_to=reply_to if index == 1 else None, metadata=metadata)
             raw = getattr(result, "raw_response", None)
+            if isinstance(raw, dict):
+                receipt = {**(_REPLY_FILE_RECEIPT.get() or {}), **raw}
+                receipt["message_ids"] = ids + list(raw.get("message_ids", []))
+                _REPLY_FILE_RECEIPT.set(receipt)
             if not getattr(result, "success", False) or (isinstance(raw, dict) and raw.get("ambiguous")):
                 logger.warning("Long reply file %s was not confirmed delivered: %s", name, getattr(result, "error", None))
-                if isinstance(raw, dict) and raw.get("prevent_fallback"):
+                if ids or (isinstance(raw, dict) and raw.get("prevent_fallback")):
+                    result.raw_response = {**(_REPLY_FILE_RECEIPT.get() or {}), "prevent_fallback": True}
                     _REPLY_FILE_FAILURE.set(result)
                 return None
             if getattr(result, "message_id", None):
-                ids.append(str(result.message_id))
+                ids.extend(raw.get("message_ids", [str(result.message_id)]) if isinstance(raw, dict) else [str(result.message_id)])
     finally:
         await asyncio.to_thread(shutil.rmtree, folder, True)
     return ids
@@ -1349,11 +1354,14 @@ async def try_reply_file(adapter: Any, chat_id: str, content: str, *, reply_to: 
 async def _file_result(adapter: Any, chat_id: str, content: str, reply_to: Optional[str],
                        metadata: Optional[dict]) -> Any:
     failure_scope = _REPLY_FILE_FAILURE.set(None)
+    receipt_scope = _REPLY_FILE_RECEIPT.set(None)
     try:
         ids = await send_reply_as_file(adapter, chat_id, content, reply_to=reply_to, metadata=metadata)
         blocked = _REPLY_FILE_FAILURE.get()
+        receipt = _REPLY_FILE_RECEIPT.get() or {}
     finally:
         _REPLY_FILE_FAILURE.reset(failure_scope)
+        _REPLY_FILE_RECEIPT.reset(receipt_scope)
     if ids is None:
         if blocked is not None:
             return blocked
@@ -1361,7 +1369,7 @@ async def _file_result(adapter: Any, chat_id: str, content: str, reply_to: Optio
         return None
     from gateway.platforms.base import SendResult
     return SendResult(success=True, message_id=ids[0] if ids else None,
-                      raw_response={"message_ids": ids, "sent_as_file": True})
+                      raw_response={**receipt, "message_ids": ids, "sent_as_file": True})
 
 
 # Sends that must not become a reply file: the stream consumer sends one reply as many pieces
@@ -1369,6 +1377,7 @@ async def _file_result(adapter: Any, chat_id: str, content: str, reply_to: Optio
 # and once a reply's upload failed, its message fallback must not try the upload again. A complete
 # message the consumer sends (commentary) opts back in with ``reply_file_off(False)``.
 _REPLY_FILE_FAILURE: contextvars.ContextVar[Any] = contextvars.ContextVar("hermes_reply_file_failure", default=None)
+_REPLY_FILE_RECEIPT: contextvars.ContextVar[Any] = contextvars.ContextVar("hermes_reply_file_receipt", default=None)
 _REPLY_FILE_OFF: contextvars.ContextVar[bool] = contextvars.ContextVar("hermes_reply_file_off", default=False)
 
 

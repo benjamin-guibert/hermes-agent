@@ -93,7 +93,7 @@ async def test_registered_long_text_and_file_one_route(configured, tmp_path, cap
     assert sum(text.count("<#4001>") for text in texts) == 1
     assert "<@6000>" in "".join(texts)
     assert any(files == [b"original file"] for _, _, files in api.posts)
-    assert len(result["delivered_message_ids"]) == len(api.posts)
+    assert len(result.get("delivered_message_ids", result.get("message_ids", []))) == len(api.posts)
     assert len([record for record in caplog.records if "archived thread redirect" in record.getMessage()]) == 1
 
 
@@ -344,3 +344,132 @@ def test_external_cron_partial_timeout_keeps_actual_receipt_without_replay(confi
     assert len(attempted) == 2 and len(api.posts) == 1
     assert all(url.endswith("/4000/messages") for url in attempted)
     assert "earlier scheduled cron delivery" in reply_pointer("tail", replied_to=("discord", "4000", "9001"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing", [False, True])
+@pytest.mark.parametrize("length", [40, 2000])
+async def test_registered_caption_budget_and_missing_mentions(configured, tmp_path, missing, length):
+    api, load = configured
+    _, pconfig = load()
+    path = tmp_path / "caption.png"
+    if not missing:
+        path.write_bytes(b"image")
+    text = "<@6000>" + "x" * (length - 7)
+    mentions = {"parse": [], "replied_user": False}
+    result = await _send_to_platform(Platform.DISCORD, pconfig, "5000", text, thread_id="4001",
+                                     media_files=[(str(path), False)], mentions=mentions)
+    assert result["success"]
+    assert all(url.endswith("/4000/messages") for url, _, _ in api.posts)
+    assert all(payload.get("allowed_mentions") == mentions for _, payload, _ in api.posts)
+    bodies = [payload.get("content", "") for _, payload, _ in api.posts]
+    assert all(len(body) <= 2000 for body in bodies)
+    import re
+    assert "".join(re.sub(r" \(\d+/\d+\)$", "", body) for body in bodies) == "<#4001>\n" + text
+    assert sum(bool(files) for _, _, files in api.posts) == (0 if missing else 1)
+    assert result["chat_id"] == "4000"
+    assert len(result.get("delivered_message_ids", result.get("message_ids", []))) == len(api.posts)
+
+
+@pytest.mark.parametrize("with_media", [False, True])
+def test_live_cron_partial_text_keeps_parent_receipt(configured, tmp_path, monkeypatch, caplog, with_media):
+    import threading
+    from cron import scheduler_delivery as scheduler
+    from tests.gateway.test_discord_free_response import FakeThread, FakeTextChannel, FakeForumChannel
+    _api, load = configured
+    config, pconfig = load()
+    monkeypatch.setattr(discord_platform.discord, "Thread", FakeThread)
+    monkeypatch.setattr(discord_platform.discord, "ForumChannel", FakeForumChannel)
+    parent = FakeTextChannel(channel_id=4000)
+    parent.send = AsyncMock(side_effect=[SimpleNamespace(id=9001), TimeoutError("tail ack lost"),
+                                        SimpleNamespace(id=9003, attachments=[object()])])
+    thread = FakeThread(channel_id=4001, parent=parent)
+    thread.archived = True
+    thread.send = AsyncMock()
+    live = platform_registry.get("discord").adapter_factory(pconfig)
+    live._client = SimpleNamespace(get_channel=lambda channel_id: thread if channel_id == 4001 else parent,
+                                   fetch_channel=AsyncMock(return_value=thread))
+    mirror = MagicMock()
+    monkeypatch.setattr(scheduler, "_maybe_mirror_cron_delivery", mirror)
+    loop = asyncio.new_event_loop()
+    worker = threading.Thread(target=loop.run_forever)
+    worker.start()
+    try:
+        path = tmp_path / "report.txt"
+        path.write_bytes(b"report")
+        state = target(config, pconfig, loop, live)
+        errors, delivery_errors = [], []
+        with caplog.at_level(logging.INFO):
+            assert scheduler._deliver_via_live_adapter(state, "x" * 4100,
+                [(str(path), False)] if with_media else [], target_errors=errors,
+                delivery_errors=delivery_errors, unverified_targets=[])
+        assert not errors and delivery_errors
+        assert state.delivery_receipt["chat_id"] == "4000"
+        assert state.delivery_receipt["message_ids"] == (["9001", "9003"] if with_media else ["9001"])
+        assert parent.send.await_count == (3 if with_media else 2)
+        thread.send.assert_not_awaited()
+        assert "delivered to discord:4000" in caplog.text
+        assert mirror.call_args.args[2] == "4000"
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        worker.join(timeout=5)
+        loop.close()
+
+
+@pytest.mark.parametrize("with_media", [False, True])
+@pytest.mark.parametrize("failure", ["unknown", "definitive"])
+def test_scheduler_first_post_unknown_never_dispatches_standalone(configured, tmp_path, monkeypatch, caplog, with_media, failure):
+    import threading
+    from cron import scheduler_delivery as scheduler
+    from tests.gateway.test_discord_free_response import FakeThread, FakeTextChannel, FakeForumChannel
+    _api, load = configured
+    _config, pconfig = load()
+    monkeypatch.setattr(discord_platform.discord, "Thread", FakeThread)
+    monkeypatch.setattr(discord_platform.discord, "ForumChannel", FakeForumChannel)
+    parent = FakeTextChannel(channel_id=4000)
+    possibly_visible = []
+    class Refused(Exception):
+        status = 403
+    async def post(**kwargs):
+        if failure == "definitive":
+            raise Refused("definitively rejected")
+        possibly_visible.append(kwargs["content"])
+        raise TimeoutError("first acknowledgement lost")
+    parent.send = AsyncMock(side_effect=post)
+    thread = FakeThread(channel_id=4001, parent=parent)
+    thread.archived = True
+    thread.send = AsyncMock()
+    live = platform_registry.get("discord").adapter_factory(pconfig)
+    live._client = SimpleNamespace(get_channel=lambda channel_id: thread if channel_id == 4001 else parent,
+                                   fetch_channel=AsyncMock(return_value=thread))
+    standalone = AsyncMock(return_value={"success": True, "chat_id": "4000", "message_id": "9001"})
+    monkeypatch.setattr("gateway.outbound.send._send_to_platform", standalone)
+    monkeypatch.setattr("cron.scheduler.load_config", lambda: {"cron": {"wrap_response": False}})
+    loop = asyncio.new_event_loop()
+    worker = threading.Thread(target=loop.run_forever)
+    worker.start()
+    try:
+        path = tmp_path / "report.txt"
+        path.write_bytes(b"report")
+        content = "first post" + (f"\nMEDIA:{path}" if with_media else "")
+        job = {"id": "fixture-job", "name": "proof", "deliver": "discord:5000:4001"}
+        with caplog.at_level(logging.INFO):
+            error = scheduler._deliver_result(job, content, adapters={Platform.DISCORD: live}, loop=loop)
+        parent.send.assert_awaited_once()
+        thread.send.assert_not_awaited()
+        if failure == "unknown":
+            assert len(possibly_visible) == 1
+            standalone.assert_not_awaited()
+            assert error and not job.get("last_delivery_reached_none")
+            assert job["last_delivery_unverified"]
+            assert "unconfirmed to discord:4000" in caplog.text
+            assert "confirmed_ids=[]" in caplog.text
+            assert "delivered to discord:" not in caplog.text
+        else:
+            standalone.assert_awaited_once()
+            assert not possibly_visible
+            assert error is None
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        worker.join(timeout=5)
+        loop.close()
