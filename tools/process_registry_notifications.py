@@ -442,7 +442,9 @@ def process_completion_display_text(events: list) -> str:
         return f"{len(events)} Background Processes Finished"
     evt = events[0]
     reason, exit_code = evt.get("completion_reason") or "exited", evt.get("exit_code", "?")
-    if reason == "killed":
+    if evt.get("interrupted"):
+        outcome = "Interrupted"
+    elif reason == "killed":
         outcome = "Terminated"
     elif reason in _REASON_STATUS:
         outcome = "Lost"
@@ -535,8 +537,21 @@ def _delegation_attribution_line(evt: dict) -> str | None:
             + (f' Task: "{goal}"' if goal else ""))
 
 
+def _interrupted_status(evt: dict) -> str:
+    """An owed death notice (``interrupted``): the cause and the time, so the owner can re-arm the job."""
+    if evt.get("completion_reason") == "lost":
+        return ("task interrupted — the process was gone when the gateway came back "
+                "(died during a gateway restart/downtime); outcome unknown")
+    when = evt.get("exited_at")
+    at = f" at {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(when))}" if isinstance(when, (int, float)) and when > 0 else ""
+    return (f"task interrupted — killed by {evt.get('termination_source') or 'Hermes'}{at} "
+            "(a Hermes lifecycle stop such as a gateway restart, not its own exit; re-run it if still needed)")
+
+
 def _completion_status(evt: dict) -> str:
     reason = evt.get("completion_reason") or "exited"
+    if evt.get("interrupted"):
+        return _interrupted_status(evt)
     if reason == "killed":
         return f"terminated by {evt.get('termination_source') or 'Hermes'}"
     return _REASON_STATUS.get(reason) or ("completed normally" if evt.get("exit_code", "?") == 0 else "exited")
@@ -583,6 +598,9 @@ def format_process_notification(evt: dict) -> str | None:
         # Say so where the output is the payload (a teammate's reply): a silent tail reads as whole.
         _out = (f"...(first {evt['output_cut']} characters cut — process(action=\"log\", "
                 f"session_id=\"{_sid}\") has the full output)\n{_out}")
+    _exit_part = "" if evt.get("interrupted") and not isinstance(_exit, int) else f" (exit code {_exit}{_signal})"
+    _output_part = "Output: none captured (the process died while the gateway was down)" if (
+        evt.get("interrupted") and not _out) else f"Output:\n{_out}"
     return (
-        f"[IMPORTANT: Background process {_sid} {_completion_status(evt)} (exit code {_exit}{_signal}).\n"
-        f"{attribution}Command: {_cmd}\nOutput:\n{_out}]")
+        f"[IMPORTANT: Background process {_sid} {_completion_status(evt)}{_exit_part}.\n"
+        f"{attribution}Command: {_cmd}\n{_output_part}]")
