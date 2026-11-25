@@ -5,6 +5,7 @@ gateway.platforms.*.
 """
 
 import re
+from contextvars import ContextVar
 import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -63,6 +64,21 @@ class ProcessingOutcome(Enum):
     CANCELLED = "cancelled"
 
 
+current_reply_trigger: ContextVar[Any] = ContextVar("current_reply_trigger", default=None)
+
+
+def event_reply_metadata(event, metadata):
+    """Bind reply permission only to the unchanged event that supplied it."""
+    trigger = getattr(event, "reply_trigger", None)
+    if (trigger is not None and not getattr(event, "internal", False)
+            and getattr(trigger, "message_id", None) == str(event.message_id)
+            and getattr(trigger, "thread_id", None) == str(event.source.thread_id)
+            and getattr(trigger, "author_id", None) == str(event.source.user_id)
+            and getattr(trigger, "created_at", None) == event.timestamp):
+        return {**(metadata or {}), "reply_trigger": trigger, "reply_to_message_id": str(event.message_id)}
+    return metadata
+
+
 @dataclass
 class MessageEvent:
     """Incoming message from a platform — the normalized shape all adapters produce."""
@@ -75,6 +91,7 @@ class MessageEvent:
     # exposes ~60 unguarded ``.source.<attr>`` reads, so that is a separate change.
     source: SessionSource = None
     raw_message: Any = None
+    reply_trigger: Any = None
     message_id: Optional[str] = None
     # Delivery-ledger identity for the final send, when it differs from ``message_id``. A queued
     # (/queue) chain answers the LAST message of the chain, so its final send has to be ledgered
@@ -158,6 +175,7 @@ class MessageEvent:
 
     def absorb_reply_expected(self, other: "MessageEvent") -> None:
         """One turn now answers *other* too: an addressed message wins, then an unknown one."""
+        self.reply_trigger = None
         if self.reply_expected is not True and other.reply_expected is not False:
             self.reply_expected = other.reply_expected
 

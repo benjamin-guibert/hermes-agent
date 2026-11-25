@@ -41,12 +41,13 @@ async def test_discord_tool_long_reply_uses_file(monkeypatch):
         def __init__(self, **kwargs): pass
         async def __aenter__(self): return self
         async def __aexit__(self, *args): pass
+        def get(self, url, **kwargs):
+            return _StreamingAiohttpResponse(200, json.dumps({'id': url.rsplit('/', 1)[-1], 'type': 0}).encode())
         def post(self, url, **kwargs):
             calls.append(kwargs)
             return _StreamingAiohttpResponse(200, json.dumps({'id':str(len(calls))}).encode())
     _discord_entry()
     monkeypatch.setattr(aiohttp, 'ClientSession', Session)
-    monkeypatch.setattr(dc, '_standalone_is_forum', AsyncMock(return_value=False))
     await _send_to_platform(Platform.DISCORD, PlatformConfig(enabled=True, token='fake'), '111', _body(60000))
     assert any('data' in c for c in calls)
 

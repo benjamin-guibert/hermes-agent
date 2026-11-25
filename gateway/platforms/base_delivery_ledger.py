@@ -6,12 +6,31 @@ Calls go through the adapter's ``_record_delivery_obligation`` / ``_finalize_del
 methods so a subclass (the local session adapter) can opt out of ledgering.
 """
 import asyncio
+from contextlib import contextmanager
+
+from gateway.platforms.event import current_reply_trigger
+import json
 import logging
 from typing import Any, Awaitable, Callable, Optional
 
 from gateway.final_delivery_claims import claim, take_claim
+from gateway.delivery_ledger import current_delivery_obligation, ledger_enabled
 
 logger = logging.getLogger("gateway.platforms.base")
+
+
+@contextmanager
+def final_reply_scope(adapter, event):
+    existing = current_reply_trigger.get()
+    if isinstance(existing, tuple) and len(existing) == 4 and existing[1] is asyncio.current_task():
+        yield
+        return
+    token = current_reply_trigger.set((getattr(event, "reply_trigger", None), asyncio.current_task(),
+                                       adapter._final_delivery_adapter(event.source), {}))
+    try:
+        yield
+    finally:
+        current_reply_trigger.reset(token)
 
 
 async def ledger_bracket(adapter: Any, event: Any, session_key: str, text_content: str,
@@ -28,7 +47,12 @@ async def ledger_bracket(adapter: Any, event: Any, session_key: str, text_conten
         if obligation_id is None and held is not None:
             held.release()  # not ledgered (ledger off, a command reply): no boot resends it
             held = None
-        result = await send(delivery_adapter, obligation_id)
+        disabled = obligation_id is None and not await asyncio.to_thread(ledger_enabled)
+        progress_scope = current_delivery_obligation.set((obligation_id, asyncio.current_task(), disabled))
+        try:
+            result = await send(delivery_adapter, obligation_id)
+        finally:
+            current_delivery_obligation.reset(progress_scope)
         if obligation_id is not None:
             await adapter._finalize_delivery_obligation(obligation_id, result, event, delivery_adapter)
     finally:
@@ -97,16 +121,26 @@ async def finalize_final_obligation(adapter: Any, obligation_id: str, result: An
     backoff has passed instead of waiting for the next restart (#91653)."""
     try:
         from gateway.dead_targets import classify_dead_error
-        from gateway.delivery_ledger import is_reconnect_only, mark_delivered, mark_failed
+        from gateway.delivery_ledger import is_reconnect_only, mark_delivered, mark_failed, receipt_json
         if getattr(result, "success", False):
-            await asyncio.to_thread(mark_delivered, obligation_id)
+            raw = getattr(result, "raw_response", None)
+            if isinstance(raw, dict) and "chat_id" in raw:
+                receipt = {key: raw[key] for key in ("chat_id", "thread_id", "message_ids") if key in raw}
+                await asyncio.to_thread(mark_delivered, obligation_id, json.dumps(receipt))
+            else:
+                await asyncio.to_thread(mark_delivered, obligation_id)
             return
         error = str(getattr(result, "error", "") or "")
-        await asyncio.to_thread(mark_failed, obligation_id, error)
+        raw = getattr(result, "raw_response", None) or {}
+        receipt = receipt_json(result) if raw.get("progress_contract") or raw.get("prevent_fallback") else None
+        if receipt is None:
+            await asyncio.to_thread(mark_failed, obligation_id, error)
+        else:
+            await asyncio.to_thread(mark_failed, obligation_id, error, receipt)
         if is_reconnect_only(error):
             redeliver = getattr(
                 adapter.gateway_runner, "_redeliver_failed_obligations_for_platform", None)
-            live = adapter._final_delivery_adapter(event.source)
+            live = adapter._registry_delivery_adapter(event.source)
             if live is not delivery_adapter and callable(redeliver):
                 await redeliver(event.source.platform,
                                 profile=getattr(delivery_adapter, "_owner_profile", None))

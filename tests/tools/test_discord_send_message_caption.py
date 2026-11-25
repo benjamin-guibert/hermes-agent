@@ -49,6 +49,13 @@ def _session_with(responses):
 
     session = MagicMock()
     session.post = MagicMock(side_effect=_post)
+    def _get(url, **kwargs):
+        response = _resp(200, {"id": url.rsplit("/", 1)[-1], "type": 0})
+        context = MagicMock()
+        context.__aenter__ = AsyncMock(return_value=response)
+        context.__aexit__ = AsyncMock(return_value=False)
+        return context
+    session.get = MagicMock(side_effect=_get)
     session_ctx = MagicMock()
     session_ctx.__aenter__ = AsyncMock(return_value=session)
     session_ctx.__aexit__ = AsyncMock(return_value=False)

@@ -39,7 +39,8 @@ def record_cron_delivery(platform: Any, chat_id: Any, text: str, send_result: An
            *(raw.get("message_ids") or ()), raw.get("last_message_id"), *(raw.get("continuation_message_ids") or ()),
            *(raw.get("delivered_message_ids") or ())]
     from gateway import rich_sent_store
-    rich_sent_store.record_marker(_chat_key(platform, chat_id), ids, _CRON_MARKER, text.splitlines()[0])
+    actual_chat = raw.get("thread_id") or raw.get("chat_id") or _field(send_result, "thread_id") or _field(send_result, "chat_id") or chat_id
+    rich_sent_store.record_marker(_chat_key(platform, actual_chat), ids, _CRON_MARKER, text.splitlines()[0])
 
 
 async def recording_cron_delivery(send: Awaitable, record: Callable[..., Any]) -> Any:

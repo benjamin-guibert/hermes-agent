@@ -52,6 +52,9 @@ def _ensure_obligations_table(conn) -> None:
     if "adapter_profile" not in {row[1] for row in conn.execute("PRAGMA table_info(delivery_obligations)")}:
         add_column_if_missing(conn, "delivery_obligations", "adapter_profile", "adapter_profile TEXT")
 
+    if "delivery_receipt" not in {row[1] for row in conn.execute("PRAGMA table_info(delivery_obligations)")}:
+        add_column_if_missing(conn, "delivery_obligations", "delivery_receipt", "delivery_receipt TEXT")
+
 
 # Drops settled rows past retention, then the oldest rows over the row cap, settled ones first.
 def _prune_unlocked(conn, now: float) -> None:
@@ -159,11 +162,33 @@ class DeliveryObligationVerbs:
     def mark_obligation_attempting(self, *, obligation_id: str) -> None:
         self._update_state(obligation_id, "attempting")
 
-    def mark_obligation_delivered(self, *, obligation_id: str) -> None:
-        self._update_state(obligation_id, "delivered")
+    def mark_obligation_delivered(self, *, obligation_id: str, delivery_receipt: Optional[str] = None) -> None:
+        def _do(conn):
+            conn.execute("UPDATE delivery_obligations SET state='delivered', updated_at=?, last_error=NULL, "
+                         "delivery_receipt=COALESCE(?, delivery_receipt) WHERE obligation_id=?",
+                         (time.time(), delivery_receipt, obligation_id))
+        with translated():
+            self._obligation_write(_do)
 
-    def mark_obligation_failed(self, *, obligation_id: str, error: str = '') -> None:
-        self._update_state(obligation_id, "failed", error=error)
+    def mark_obligation_failed(self, *, obligation_id: str, error: str = '', delivery_receipt: Optional[str] = None) -> None:
+        def _do(conn):
+            conn.execute("UPDATE delivery_obligations SET state='failed', updated_at=?, last_error=?, "
+                         "delivery_receipt=COALESCE(?, delivery_receipt) WHERE obligation_id=?",
+                         (time.time(), error[:500] if error else None, delivery_receipt, obligation_id))
+        with translated():
+            self._obligation_write(_do)
+
+    def set_obligation_receipt(self, *, obligation_id: str, delivery_receipt: str) -> None:
+        with translated():
+            self._obligation_write(lambda conn: conn.execute(
+                "UPDATE delivery_obligations SET delivery_receipt=? WHERE obligation_id=?",
+                (delivery_receipt, obligation_id)))
+
+    def get_obligation_receipt(self, *, obligation_id: str) -> Optional[str]:
+        with translated():
+            row = self._obligation_read(lambda conn: conn.execute(
+                "SELECT delivery_receipt FROM delivery_obligations WHERE obligation_id=?", (obligation_id,)).fetchone())
+        return row[0] if row else None
 
     def release_runtime_obligation_claim(self, *, obligation_id: str, error: str = '', owner: OwnerStamp) -> bool:
         """Return an unsent runtime claim to ``failed`` without spending an attempt, fail-closed to the exact

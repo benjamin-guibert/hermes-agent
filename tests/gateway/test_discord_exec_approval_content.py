@@ -16,7 +16,7 @@ def _capture_channel(adapter):
         sent.update(kwargs)
         return SimpleNamespace(id=1234)
 
-    channel = SimpleNamespace(send=AsyncMock(side_effect=fake_send))
+    channel = SimpleNamespace(id=555, send=AsyncMock(side_effect=fake_send))
     adapter._client = SimpleNamespace(
         get_channel=lambda _chat_id: channel,
         fetch_channel=AsyncMock(),
@@ -163,7 +163,7 @@ async def test_card_retires_when_backend_request_ends(monkeypatch, ends, footer_
             await asyncio.sleep(0)
         return message
 
-    channel = SimpleNamespace(send=send)
+    channel = SimpleNamespace(id=555, send=send)
     adapter._client = SimpleNamespace(get_channel=lambda _id: channel)
     await adapter.send_exec_approval(chat_id="555", command="ls", session_key=session, request_id="request-1")
     view = sent["view"]

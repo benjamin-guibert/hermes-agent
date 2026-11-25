@@ -152,8 +152,12 @@ class TestAdapterSessionCancellation:
         await adapter.handle_message(
             _make_event("/model xiaomi/mimo-v2-pro --provider nous")
         )
-        await asyncio.sleep(0)
-        await asyncio.sleep(0)
+        # Final settlement now includes a ledger worker-thread hop. Wait for
+        # the reply, as the stale-lock control below already does.
+        for _ in range(40):
+            if any("handled:model" in r for r in adapter.sent_responses):
+                break
+            await asyncio.sleep(0.05)
 
         assert any("handled:model" in r for r in adapter.sent_responses), (
             f"follow-up /model stayed blocked after {command_text}"

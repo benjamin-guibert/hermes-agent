@@ -97,11 +97,24 @@ class ObligationLedger:
     def mark_obligation_attempting(self, *, obligation_id: str) -> None:
         self._update_state(obligation_id, "attempting")
 
-    def mark_obligation_delivered(self, *, obligation_id: str) -> None:
+    def mark_obligation_delivered(self, *, obligation_id: str, delivery_receipt: Optional[str] = None) -> None:
         self._update_state(obligation_id, "delivered")
+        if delivery_receipt is not None:
+            self.set_obligation_receipt(obligation_id=obligation_id, delivery_receipt=delivery_receipt)
 
-    def mark_obligation_failed(self, *, obligation_id: str, error: str = '') -> None:
+    def mark_obligation_failed(self, *, obligation_id: str, error: str = '', delivery_receipt: Optional[str] = None) -> None:
         self._update_state(obligation_id, "failed", error)
+        if delivery_receipt is not None:
+            self.set_obligation_receipt(obligation_id=obligation_id, delivery_receipt=delivery_receipt)
+
+    def set_obligation_receipt(self, *, obligation_id: str, delivery_receipt: str) -> None:
+        row = self._obligations().get(obligation_id)
+        if row is not None:
+            row["delivery_receipt"] = delivery_receipt
+
+    def get_obligation_receipt(self, *, obligation_id: str) -> Optional[str]:
+        row = self._obligations().get(obligation_id)
+        return row.get("delivery_receipt") if row is not None else None
 
     def release_runtime_obligation_claim(self, *, obligation_id: str, error: str = '', owner: OwnerStamp) -> bool:
         if owner.started_at is None:

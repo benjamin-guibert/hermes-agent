@@ -19,6 +19,7 @@ from contextvars import copy_context
 from pathlib import Path
 from agent.i18n import t
 from gateway.config import Platform
+from gateway.outbound.operation import outbound_delivery_scope
 from gateway.delivery import looks_like_telegram_private_chat_id, prime_revived_egress
 from gateway.platforms.base import BasePlatformAdapter
 from gateway.platforms.event import MessageEvent, MessageType
@@ -482,7 +483,7 @@ class GatewayStartupMixin:
         # No early return on an empty claim: the boot sweep may have ADOPTED flood-refused rows that are
         # not due yet, and those still need their timer armed below.
         try:
-            from gateway.delivery_ledger import RECOVERED_MARKER, mark_delivered, mark_failed
+            from gateway.delivery_ledger import RECOVERED_MARKER, mark_delivered, mark_failed, get_delivery_receipt, receipt_json, checkpoint_recovered_attempt, current_delivery_obligation, guarded_progress_receipt
         except Exception:
             logger.debug("delivery ledger import failed", exc_info=True)
             return 0
@@ -500,22 +501,40 @@ class GatewayStartupMixin:
                 content = row.get("marker", RECOVERED_MARKER) + content
             metadata = {"thread_id": row["thread_id"]} if row.get("thread_id") else None
             try:
-                result = await adapter.send(chat_id=row["chat_id"], content=content, metadata=metadata)
+                receipt = await asyncio.to_thread(get_delivery_receipt, row["obligation_id"])
+                progress_scope = current_delivery_obligation.set((row["obligation_id"], asyncio.current_task()))
+                try:
+                    with outbound_delivery_scope():
+                        if row["platform"] == "discord" and receipt is not None and guarded_progress_receipt(receipt):
+                            await asyncio.to_thread(checkpoint_recovered_attempt, row["obligation_id"], receipt)
+                            resume = getattr(adapter, "resume_delivery_receipt", None)
+                            result = await resume(receipt) if callable(resume) else None
+                        else:
+                            result = await adapter.send(chat_id=row["chat_id"], content=content, metadata=metadata)
+                finally:
+                    current_delivery_obligation.reset(progress_scope)
             except Exception as send_err:
                 logger.warning("obligation %s: redelivery send raised: %s", row["obligation_id"], send_err)
                 result = None
             with _log_suppressed(logging.DEBUG, "delivery ledger update failed", exc_info=True):
                 if result is not None and getattr(result, "success", False):
-                    await asyncio.to_thread(mark_delivered, row["obligation_id"])
+                    progress = receipt_json(result)
+                    if progress is None:
+                        await asyncio.to_thread(mark_delivered, row["obligation_id"])
+                    else:
+                        await asyncio.to_thread(mark_delivered, row["obligation_id"], progress)
                     redelivered += 1
                     logger.info(
                         "Redelivered recovered final response to %s:%s (obligation %s, attempt %d)",
                         row["platform"], row["chat_id"], row["obligation_id"], row["attempts"],
                     )
                 else:
-                    await asyncio.to_thread(
-                        mark_failed, row["obligation_id"], str(getattr(result, "error", "") or "send failed")
-                    )
+                    error = str(getattr(result, "error", "") or "send failed")
+                    progress = receipt_json(result)
+                    if progress is None:
+                        await asyncio.to_thread(mark_failed, row["obligation_id"], error)
+                    else:
+                        await asyncio.to_thread(mark_failed, row["obligation_id"], error, progress)
         # Whatever is still waiting on a flood penalty or a retry backoff (adopted at boot, skipped as not
         # yet due, refused again just now) gets a timer, so no rejected reply waits for the next restart.
         with _log_suppressed(logging.DEBUG, "arming flood redelivery timers failed", exc_info=True):

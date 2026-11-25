@@ -114,8 +114,14 @@ async def test_send_goes_out_unless_status_to_known_archived_thread(make_adapter
     with caplog.at_level(logging.INFO):
         result = await adapter.send(PARENT_ID, "hello", metadata=metadata)
 
-    channel.send.assert_awaited_once()
-    assert result.success is True and result.message_id == "9001"
+    requires_guard = isinstance(channel, FakeThread) and getattr(channel, "archived", None) is not False
+    if requires_guard:
+        channel.send.assert_not_awaited()
+        assert result.success is False
+        assert "delivery refused" in result.error
+    else:
+        channel.send.assert_awaited_once()
+        assert result.success is True and result.message_id == "9001"
     assert not _skip_lines(caplog)
 
 
@@ -126,3 +132,36 @@ async def test_send_goes_out_unless_status_to_known_archived_thread(make_adapter
 def test_yaml_key_seeds_adapter_extra(discord_cfg, expected):
     seeded = _apply_yaml_config({}, discord_cfg) or {}
     assert ({k: seeded[k] for k in ("skip_status_in_archived_threads",) if k in seeded} or None) == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("skip,redirect,state", [(True, True, "archived"), (False, True, "archived"),
+    (True, False, "archived"), (False, False, "archived"), (True, True, "unknown"), (True, True, "error")])
+async def test_fresh_archive_status_is_noop_before_parent_route(make_adapter, skip, redirect, state):
+    parent = SimpleNamespace(id=4000, send=AsyncMock(return_value=SimpleNamespace(id=9002)))
+    cached = FakeThread(THREAD_ID, archived=False, parent=parent, parent_id=4000)
+    fresh = FakeThread(THREAD_ID, archived=None if state == "unknown" else True, parent=parent, parent_id=4000)
+    adapter = make_adapter(cached, skip_status_in_archived_threads=skip,
+                           redirect_archived_thread_messages=redirect)
+    adapter._client.fetch_channel = AsyncMock(return_value=fresh)
+    if state == "error":
+        adapter._client.fetch_channel.side_effect = RuntimeError("state unavailable")
+    result = await adapter.send(PARENT_ID, "Restart status", metadata=STATUS)
+    if not redirect:
+        assert result.success and result.message_id == "9001"
+        adapter._client.fetch_channel.assert_not_awaited()
+        cached.send.assert_awaited_once()
+    else:
+        adapter._client.fetch_channel.assert_awaited_once_with(int(THREAD_ID))
+        cached.send.assert_not_awaited()
+        fresh.send.assert_not_awaited()
+        if state != "archived":
+            assert not result.success
+        elif skip:
+            assert result.success and result.message_id is None
+            assert result.raw_response["skipped"] == "archived_thread"
+        else:
+            assert result.success and result.raw_response["chat_id"] == "4000"
+            parent.send.assert_awaited_once()
+    if skip or not redirect or state != "archived":
+        parent.send.assert_not_awaited()
