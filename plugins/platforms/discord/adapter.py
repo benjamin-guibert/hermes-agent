@@ -6914,6 +6914,7 @@ _YAML_WEBSOCKET_LIVENESS_KEYS = (
     ("websocket_heartbeat_ack_max_age_seconds", None, None),
     ("websocket_max_latency_seconds", None, None),
     ("websocket_event_max_silence_seconds", None, None),
+    ("reconnect_hold_inbound", None, None),  # not a probe knob: hold inbound across that reconnect
 )
 
 

@@ -1522,6 +1522,7 @@ DEFAULT_CONFIG = {
         # Dispatch-side dimension: a socket that ACKs heartbeats but delivers no events for this
         # long is treated as deaf. 4 h absorbs a quiet server overnight; 0 disables it.
         "websocket_event_max_silence_seconds": 14400,
+        "reconnect_hold_inbound": True,  # inbound reaching the adapter a reconnect retired waits for its replacement
         # per-channel ephemeral system prompts (forum parents apply to child threads)
         "channel_prompts": {},
         # Opt-in DM role auth: DISCORD_ALLOWED_ROLES normally authorizes guild messages only (DMs
