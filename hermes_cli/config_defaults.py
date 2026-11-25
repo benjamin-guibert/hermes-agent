@@ -1493,6 +1493,7 @@ DEFAULT_CONFIG = {
         # message in them its own thread (still mention-free). Env: DISCORD_FREE_RESPONSE_AUTO_THREAD.
         "free_response_auto_thread": False,
         "thread_require_mention": False,  # require @mention in threads too (multi-bot threads)
+        "skip_status_in_archived_threads": True,  # status notices never reopen an archived thread
         # Bot authors must type @thisbot to trigger a reply; Discord reply pings alone do not count.
         # Set False only for trusted legacy relays. Humans are unaffected.
         "bots_require_inline_mention": True,

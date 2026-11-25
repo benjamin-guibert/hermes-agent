@@ -377,6 +377,7 @@ discord:
   auto_thread: true               # Auto-create threads on @mention
   free_response_auto_thread: false # If true, free_response_channels also auto-thread (default: inline)
   reactions: true                 # Add emoji reactions during processing
+  skip_status_in_archived_threads: true  # Status notices never reopen an archived thread
   ignored_channels: []            # Channel IDs where bot never responds
   no_thread_channels: []          # Channel IDs where bot responds without threading
   history_backfill: true          # Prepend recent channel scrollback on mention (default: true)
@@ -481,6 +482,14 @@ Controls whether the bot adds emoji reactions to messages as visual feedback:
 - ❌ added if an error occurs during processing
 
 Disable this if you find the reactions distracting or if the bot's role doesn't have the **Add Reactions** permission.
+
+#### `discord.skip_status_in_archived_threads`
+
+**Type:** boolean — **Default:** `true`
+
+Discord reopens an archived thread when a message is posted to it. With this option on, Hermes does not post status notices into a thread that is archived: tool-progress lines, the "Working — N min" heartbeat, the background review summary (`💾 Self-improvement review: …`), and restart or update notices. A notice that is skipped logs one INFO line and counts as delivered, so it is not retried.
+
+Replies of the agent still go to an archived thread and reopen it, because a reply means the work continues. Hermes reads the archived state that Discord pushes over the gateway connection and makes no extra API call; when that state is not known, the notice is sent. Set `false` to post status notices into archived threads again.
 
 #### `discord.ignored_channels`
 
