@@ -438,8 +438,8 @@ if (_checkout_root := str(Path(__file__).resolve().parents[2])) not in sys.path:
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.helpers import fence_state_after, reply_file_off, try_reply_file, typing_metadata_for_turn, sender_may_see_activity, typing_pause_key, typing_refresh_wanted
 from gateway.platforms.base_post_delivery import run_post_delivery_callback
-from gateway.platforms.base_delivery_ledger import (
-    finalize_final_obligation, ledger_attempted, ledger_bracket, record_final_obligation)
+from gateway.platforms.base_delivery_ledger import finalize_final_obligation, ledger_attempted, ledger_bracket, record_final_obligation
+from gateway.final_delivery_claims import release_final_delivery
 from gateway.platforms.base_exec_approval import (
     approval_timeout_seconds, ea_action_labels, ea_default_reason_text, ea_header_text,
     ea_reason_label_text, ea_smart_deny_line_text, exec_approval_cmd_budget, format_approval_deadline_line,
@@ -4189,8 +4189,8 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
         return bool(text) and await ledger_attempted(self, event, session_key, text, error)
 
     async def _release_turn_marker(self, event: MessageEvent) -> None:
-        """Clear the crash marker handed to this delivery lifecycle only once the final reply is ledgered or
-        nothing more is owed (no kill leaves a persisted reply with neither), then wake the drain. Idempotent."""
+        """Clear the crash marker handed to this delivery lifecycle only once the final reply is ledgered or nothing more is owed (no kill leaves a persisted reply with neither), then wake the drain; drop a final-delivery claim no send took over. Idempotent."""
+        release_final_delivery(event)
         if (getattr(event, "_turn_marker_handoff", False) and getattr(event, "_gateway_active_turn_token", None)
                 and self.gateway_runner is not None):
             await self.gateway_runner._clear_durable_active_turn(event)

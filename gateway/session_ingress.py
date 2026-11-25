@@ -408,6 +408,10 @@ async def execute_admission(authority, ref, row):
                     else:
                         authority.pending_deliveries[row['admission_id']] = delivery
             handed = True
+            if response and not is_api:
+                # Still counted as work here: the reply's claim holds a restart until it is ledgered.
+                from gateway.final_delivery_claims import claim_owed_reply
+                claim_owed_reply(authority, row['admission_id'], live.route)
             await _hand_over_turn_marker(authority, row['admission_id'], event)
             return response
     finally:
@@ -568,6 +572,8 @@ async def dispatch_shared_busy(adapter, event, session_key, *, durable=False):
             response = await adapter._message_handler(event)
             # The ledgered send releases the marker off the event it sends.
             _move_marker(event, delivery_event)
+            from gateway.final_delivery_claims import move_claim
+            move_claim(event, delivery_event)
             delivery_event._turn_marker_handoff = event._turn_marker_handoff
             delivered = await deliver_response(adapter, delivery_event, session_key, response)
         except Exception as exc:

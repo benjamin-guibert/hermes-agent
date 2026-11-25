@@ -14,12 +14,13 @@ from typing import Any, Callable
 
 
 def _profile_units(runner, profile: str, units: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """What an ``unserve-profile`` of *profile* stops (``stop_authority_work``): its chat turns (session
+    """What an ``unserve-profile`` of *profile* stops (``stop_authority_work``): its chat turns and final replies in flight (session
     keys in its namespace) plus its authority's managed turns and cron runs. Delegations survive it."""
     from gateway.session import _session_key_namespace
 
     prefix = _session_key_namespace(profile) + ":"
-    mine = [u for u in units if u.get("kind") == "chat" and str(u.get("session") or "").startswith(prefix)]
+    mine = [u for u in units if u.get("kind") in ("chat", "final_delivery")
+            and str(u.get("session") or "").startswith(prefix)]
     home = (getattr(runner, "_served_profile_homes", None) or {}).get(profile)
     registry = getattr(runner, "session_authorities", None)
     authority = registry.for_home(home) if registry is not None and home is not None else None
