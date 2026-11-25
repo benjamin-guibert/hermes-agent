@@ -1819,7 +1819,7 @@ DEFAULT_CONFIG = {
         # Managed systemd gateway with no user session (containers, no linger): false runs
         # cron jobs as a direct external subprocess (warns once; no cgroup isolation), true
         # fails closed with the enable-linger remedy. Kanban always requires a scope.
-        "require_restart_safe_scope": False,
+        "require_restart_safe_scope": False, "refuse_self_removal": True,  # a run's own child cannot remove its job
         # A job failing with the SAME error alerts once, then stays silent for this many hours
         # before one reminder ping (the run is still recorded; `hermes cron incidents` shows it).
         # A green run or a different error alerts again immediately; `hermes cron incidents ack`
