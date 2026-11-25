@@ -10,12 +10,20 @@ through the live ingress gates (``_dispatch_recovered_message``), the same path 
 ``missed_message_backfill``. The window is the stop's own: it opens when admission is withdrawn,
 messages that already reached a session before it are excluded by id, and a window older than
 ``_MAX_AGE_SECONDS`` (a long outage, not a restart) is not replayed. Crashes write no window.
+
+Each refusal changes the window while the stop drains, and an fsync on a loaded host took seconds:
+one write per refused message on the event loop stalled a restart into its shutdown watchdog. With
+``discord.stop_replay_write_off_loop`` (default on) the loop only snapshots the window; one worker
+writes the latest snapshot (the ones that arrive during a write coalesce), and the adapter teardown
+awaits that writer, so the final window is on disk before the process exits.
 """
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import logging
+import threading
 import time
 from collections import deque
 from contextlib import suppress
@@ -52,14 +60,20 @@ def message_refs(event: Any) -> list[tuple[str, str]]:
 
 
 def recovery_extra(discord_cfg: dict) -> dict:
-    """``config.extra`` seeds for the ``discord.missed_message_backfill`` and ``discord.stop_replay``
-    YAML keys (extra only: neither has an env bridge)."""
+    """``config.extra`` seeds for the ``discord.missed_message_backfill``, ``discord.stop_replay`` and
+    ``discord.stop_replay_write_off_loop`` YAML keys (extra only: none has an env bridge)."""
     seeded: dict[str, Any] = {}
     if isinstance(discord_cfg.get("missed_message_backfill"), dict):
         seeded["missed_message_backfill"] = dict(discord_cfg["missed_message_backfill"])
-    if "stop_replay" in discord_cfg:
-        seeded["stop_replay"] = discord_cfg["stop_replay"]
+    for key in ("stop_replay", "stop_replay_write_off_loop"):
+        if key in discord_cfg:
+            seeded[key] = discord_cfg[key]
     return seeded
+
+
+def _enabled(extra: dict, key: str) -> bool:
+    value = extra.get(key, True)
+    return value if isinstance(value, bool) else str(value).strip().lower() not in _FALSE
 
 
 class StopReplayWindow:
@@ -72,6 +86,10 @@ class StopReplayWindow:
         self.batch_window = 0.0
         self.deferred: dict[str, str] = {}
         self._dispatched: deque[tuple[float, str, str]] = deque(maxlen=512)
+        self._write_lock = threading.Lock()
+        self._pending: Optional[dict] = None
+        self._writing = False
+        self._writer: Optional[asyncio.Future] = None
 
     @property
     def open(self) -> bool:
@@ -81,34 +99,79 @@ class StopReplayWindow:
         now = time.time()
         self._dispatched.extend((now, message_id, channel_id) for message_id, channel_id in refs)
 
-    def withdraw(self, batch_window: float) -> None:
+    def withdraw(self, batch_window: float, *, off_loop: bool = False) -> None:
         """Admission was withdrawn: open the window and record what already reached a session."""
         now = time.time()
         self.withdrawn_at = now
         self.opened_at = self.opened_at or now
         self.batch_window = batch_window
-        self.save()
+        if off_loop:
+            self.save_soon()
+        else:
+            self.save()
 
-    def defer(self, refs: list[tuple[str, str]], batch_window: float) -> None:
+    def defer(self, refs: list[tuple[str, str]], batch_window: float, *, off_loop: bool = False) -> None:
         self.opened_at = self.opened_at or time.time()
         self.batch_window = batch_window
         for message_id, channel_id in refs:
             self.deferred[message_id] = channel_id
-        self.save()
+        if off_loop:
+            self.save_soon()
+        else:
+            self.save()
 
     def save(self) -> None:
-        from utils import atomic_json_write
+        self._write(self._payload())
+
+    def save_soon(self) -> None:
+        """Snapshot the window here and write it on a worker; inline when no loop runs."""
+        payload = self._payload()
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._write(payload)
+            return
+        with self._write_lock:
+            self._pending = payload
+            if self._writing:
+                return  # the running writer takes this snapshot next
+            self._writing = True
+        self._writer = loop.run_in_executor(None, self._drain)
+
+    async def flush(self) -> None:
+        """Wait until the latest snapshot is on disk."""
+        if self._writer is not None:
+            await self._writer
+
+    def _drain(self) -> None:
+        while True:
+            with self._write_lock:
+                payload, self._pending = self._pending, None
+                if payload is None:
+                    self._writing = False
+                    return
+            try:
+                self._write(payload)
+            except BaseException:
+                with self._write_lock:
+                    self._writing = False
+                raise
+
+    def _payload(self) -> dict:
         floor = (self.withdrawn_at or self.opened_at) - self.batch_window - _CLOCK_MARGIN_SECONDS
         recent = time.time() - _RECENT_SECONDS
-        payload = {
+        return {
             "version": _STATE_VERSION,
             "withdrawn_at": self.withdrawn_at, "opened_at": self.opened_at, "floor": floor,
-            "deferred": self.deferred,
+            "deferred": dict(self.deferred),  # a snapshot: a worker may serialise it
             # Reached a session before the stop (steered, queued, answered): never replayed.
             "skip": sorted({mid for ts, mid, _ in self._dispatched if ts >= floor} - set(self.deferred)),
             "channels": sorted({cid for ts, _, cid in self._dispatched if ts >= recent}
                                | set(self.deferred.values())),
         }
+
+    def _write(self, payload: dict) -> None:
+        from utils import atomic_json_write
         # No mkdir here: atomic_json_write creates the dir through mkdir_under_hermes_home, so a deleted
         # or renamed profile home is never recreated (its refusal is the OSError below).
         try:
@@ -155,8 +218,11 @@ class DiscordRecoveryMixin:
 
     def _stop_replay_enabled(self) -> bool:
         """``discord.stop_replay`` (default on)."""
-        value = self.config.extra.get("stop_replay", True)
-        return value if isinstance(value, bool) else str(value).strip().lower() not in _FALSE
+        return _enabled(self.config.extra, "stop_replay")
+
+    def _stop_replay_off_loop(self) -> bool:
+        """``discord.stop_replay_write_off_loop`` (default on)."""
+        return _enabled(self.config.extra, "stop_replay_write_off_loop")
 
     @cached_property
     def _stop_replay(self) -> StopReplayWindow:
@@ -167,7 +233,7 @@ class DiscordRecoveryMixin:
 
     def set_message_handler(self, handler) -> None:
         if handler is None and self._message_handler is not None and self._stop_replay_enabled():
-            self._stop_replay.withdraw(self._stop_replay_batch_window())
+            self._stop_replay.withdraw(self._stop_replay_batch_window(), off_loop=self._stop_replay_off_loop())
         super().set_message_handler(handler)
 
     def _enqueue_text_event(self, event) -> None:
@@ -190,10 +256,17 @@ class DiscordRecoveryMixin:
         refs = message_refs(event)
         if not refs or not self._stop_replay_enabled():
             return
-        self._stop_replay.defer(refs, self._stop_replay_batch_window())
+        self._stop_replay.defer(refs, self._stop_replay_batch_window(), off_loop=self._stop_replay_off_loop())
         for message_id, channel_id in refs:
             logger.info("[%s] Inbound message %s in chat %s deferred to the replay after the stop",
                         self.name, message_id, channel_id)
+
+    async def cancel_background_tasks(self) -> None:
+        """The adapter teardown: the final stop window is on disk before it returns."""
+        await super().cancel_background_tasks()
+        window = self.__dict__.get("_stop_replay")  # never built: nothing to flush
+        if window is not None:
+            await window.flush()
 
     # ── planned-stop replay: after the next connect ───────────────────────
 

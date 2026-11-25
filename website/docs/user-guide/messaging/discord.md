@@ -82,6 +82,8 @@ With `group_sessions_per_user: false`:
 
 Messages that a planned gateway stop refused or dropped are replayed once after the restart, when the stop is less than 30 minutes old. Disable with `discord.stop_replay: false`.
 
+During the stop, Hermes writes the replay window on a worker thread and merges the writes that arrive while one runs, so a slow disk does not block the event loop; the adapter waits for the last write before it exits. Set `discord.stop_replay_write_off_loop: false` to write the window on the event loop once per refused message.
+
 This guide walks you through the full setup process — from creating your bot on Discord's Developer Portal to sending your first message.
 
 ### Gateway WebSocket health

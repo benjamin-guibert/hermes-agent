@@ -161,14 +161,17 @@ class SessionLifecycleMixin:
         return "suspended" if entry.suspended else None
 
     def _update_entry(self, session_key: str, mutate) -> bool:
-        """Apply ``mutate(entry)`` under ``_lock`` and full-save; False when the entry is missing
-        or *mutate* returned False (nothing to persist)."""
+        """Apply ``mutate(entry)`` under ``_lock`` and persist that ONE row; False when the entry is
+        missing or *mutate* returned False (nothing to persist). *mutate* never changes the key ->
+        session_id mapping (structural changes take ``_save()``), so the single-row UPSERT writes the
+        same row as a full rewrite; on an event loop the write runs on a worker."""
         with self._lock:
             entry = self._entry_locked(session_key)
             if entry is None or mutate(entry) is False:
                 return False
-            self._save()
-            return True
+        from gateway.session_entry_saves import save_entry_off_loop
+        save_entry_off_loop(self, session_key)
+        return True
 
     def _update_all_entries_locked(self, mutate) -> int:
         """Apply ``mutate(entry) -> bool`` to every entry under ``_lock``; save once if any
