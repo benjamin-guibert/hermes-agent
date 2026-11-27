@@ -383,6 +383,7 @@ discord:
   reactions: true                 # Add emoji reactions during processing
   skip_status_in_archived_threads: true  # Status notices never reopen an archived thread
   redirect_archived_thread_messages: true  # Send closed-thread messages to the parent channel
+  owner_ping_thread: true         # A top-level post that mentions an allowed user opens its own thread
   ignored_channels: []            # Channel IDs where bot never responds
   no_thread_channels: []          # Channel IDs where bot responds without threading
   history_backfill: true          # Prepend recent channel scrollback on mention (default: true)
@@ -523,6 +524,25 @@ With the delivery ledger enabled, guarded text sends save progress before each
 post and after each acknowledgement. Recovery sends only a confirmed unsent
 suffix. An unknown remote outcome blocks automatic replay. An intentionally
 disabled delivery ledger does not block ordinary redirection.
+
+#### `discord.owner_ping_thread`
+
+**Type:** boolean — **Default:** `true`
+
+When Hermes posts a top-level message in a server text channel and the text
+mentions a human in `DISCORD_ALLOWED_USERS` (`<@id>`), Hermes opens a public
+thread on that message, so the person can answer in place. A long message that
+is split opens the thread on its first part. This applies to agent replies, cron
+results, the `send_message` tool and `hermes send`.
+
+The thread name is the first line of the message without mentions, markdown and
+leading emoji. A cron result uses the job name. A reply in the thread does not
+need an @mention, and its session starts with the text of the post.
+
+No thread opens for a message sent to a thread or a DM, a message that mentions
+only bots, or a send that failed. If Discord refuses the thread (permissions,
+rate limit), Hermes logs one warning and the message stays delivered. Set it to
+`false` to keep top-level posts without a thread.
 
 #### `discord.ignored_channels`
 

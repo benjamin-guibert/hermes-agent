@@ -1184,6 +1184,7 @@ from plugins.platforms.discord.adapter_voice_info import DiscordVoiceInfoMixin
 from plugins.platforms.discord.adapter_reactions import DiscordReactionsMixin
 from plugins.platforms.discord.adapter_vault_code import DiscordVaultCodeMixin, build_vault_code_view
 from plugins.platforms.discord.adapter_bot_tag import BotTagWindow, DiscordBotTagMixin
+from plugins.platforms.discord.owner_ping_thread import CONTINUATION_KEY as _OWNER_PING_CONTINUATION, adopt_thread as adopt_owner_ping_thread, open_live_thread as open_owner_ping_thread, open_rest_thread as open_rest_owner_ping_thread, yaml_extra as owner_ping_extra
 
 
 class DiscordAdapter(DiscordLiveGatesMixin, DiscordCommandSyncMixin, DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceInfoMixin,
@@ -1722,6 +1723,7 @@ class DiscordAdapter(DiscordLiveGatesMixin, DiscordCommandSyncMixin, DiscordAuth
                 await asyncio.wait_for(self._ready_event.wait(), timeout=30.0)
             except TimeoutError:
                 pass
+        await adopt_owner_ping_thread(self, message)
         admitted, role_authorized = self._discord_message_admission(message, claim=True)
         if not admitted:
             return False
@@ -2536,6 +2538,7 @@ class DiscordAdapter(DiscordLiveGatesMixin, DiscordCommandSyncMixin, DiscordAuth
 
     async def _dispatch_recovered_message(self, message: Any, *, claim: bool = False) -> bool:
         """Run one recovered message through the live Discord ingress gates (``claim``: own its dedup id)."""
+        await adopt_owner_ping_thread(self, message)
         if not isinstance(message.channel, discord.DMChannel):
             parent_id = self._get_parent_channel_id(message.channel)
             channel_keys = self._discord_channel_keys(message, parent_id)
@@ -3072,6 +3075,7 @@ class DiscordAdapter(DiscordLiveGatesMixin, DiscordCommandSyncMixin, DiscordAuth
                 message_id=message_ids[0] if message_ids else None,
                 raw_response=progress or {"message_ids": message_ids, "chat_id": str(channel.id), "thread_id": thread_id}
             )
+            await open_owner_ping_thread(self, channel, content, result, metadata)
             return await self._record_response_async(reply_to, result, content, final_delivery, metadata)
         except Exception as e:  # pragma: no cover - defensive logging
             logger.error("[%s] Failed to send Discord message: %s", self.name, e, exc_info=True)
@@ -3117,7 +3121,7 @@ class DiscordAdapter(DiscordLiveGatesMixin, DiscordCommandSyncMixin, DiscordAuth
         remaining = list(raw["remaining_chunks"])
         delivered_ids = list(raw.get("message_ids", []))
         actual_chat = str(raw["chat_id"])
-        actual_metadata = {**(metadata or {}), "thread_id": raw.get("thread_id")}
+        actual_metadata = {**(metadata or {}), "thread_id": raw.get("thread_id"), _OWNER_PING_CONTINUATION: True}
         for index, chunk in enumerate(remaining):
             if raw.get("progress_contract") == PROGRESS_CONTRACT:
                 actual_metadata["_redirect_progress"] = {**raw, "message_ids": list(delivered_ids), "later_chunks": remaining[index + 1:]}
@@ -6945,6 +6949,8 @@ async def _standalone_send(
             return {**send_error(error), **({"warnings": warnings} if warnings else {})}
         result = {"success": True, "platform": "discord", "chat_id": chat_id, "message_id": last_data.get("id"),
                   "thread_id": thread_id, "message_ids": message_ids}
+        await open_rest_owner_ping_thread(aiohttp, pconfig, message if message.strip() else (caption or ""), result,
+                                          _rest_url, json_headers, _sess_kw, _req_kw)
         if warnings:
             result["warnings"] = warnings
         return result
@@ -7073,7 +7079,7 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
                 _env_default(env_key, str(value))
     if "redirect_archived_thread_messages" in discord_cfg:
         seeded_extra["redirect_archived_thread_messages"] = discord_cfg["redirect_archived_thread_messages"]
-    seeded_extra.update(archived_status_extra(discord_cfg))
+    seeded_extra.update(archived_status_extra(discord_cfg), **owner_ping_extra(discord_cfg))
     return seeded_extra or None
 
 
